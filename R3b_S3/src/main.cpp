@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <HTTPClient.h>
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
@@ -34,14 +33,14 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
-// ================== TRUSTED WIFI CONFIG ==================
-#define TRUSTED_SSID "7068616e746f6d303030303030300001"
-#define TRUSTED_PASS "12345678"
-#define SCAN_INTERVAL_MS 10000UL
-#define STA_CONNECT_TIMEOUT_MS 10000UL
 #define AP_CHANNEL 1
 #define AP_HIDDEN true
 #define AP_MAX_CONN 2
+
+// ================== SERIAL COM CONFIG ==================
+#define SERIAL_BAUD 115200
+#define SERIAL_CMD_TIMEOUT_MS 5000UL
+#define SERIAL_UPLOAD_CHUNK 512
 
 // ================== LED STATE ==================
 bool uploadLedActive = false;
@@ -49,11 +48,6 @@ unsigned long uploadLedUntilMs = 0;
 const uint16_t UPLOAD_LED_HOLD_MS = 500;
 
 uint8_t lastClientCount = 0;
-
-// ================== WIFI MODE STATE ==================
-enum WifiMode { MODE_AP, MODE_STA };
-WifiMode currentMode = MODE_AP;
-unsigned long lastScanMs = 0;
 
 // ================== UPLOAD STATE ==================
 File uploadFile;
@@ -281,20 +275,7 @@ void updateStatusLed()
     }
     uploadLedActive = false;
     ledWhite(false);
-    if (currentMode == MODE_STA)
-    {
-      ledPink(true);
-    }
-    else
-    {
-      setWifiLedByClient();
-    }
-    return;
-  }
-
-  if (currentMode == MODE_STA)
-  {
-    ledPink(true);
+    setWifiLedByClient();
     return;
   }
 
@@ -303,14 +284,13 @@ void updateStatusLed()
     setWifiLedByClient();
 }
 
-// ================== API HANDLERS ==================
+// ================== API HANDLERS (WiFi AP) ==================
 void handleRoot()
 {
-  String ip = (currentMode == MODE_STA) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String ip = WiFi.softAPIP().toString();
   String msg = "ESP32-S3 microSD WiFi Server\n";
-  msg += "Mode: ";
-  msg += (currentMode == MODE_STA) ? "STA" : "AP";
-  msg += "\nIP: " + ip + "\nPort: " + String(SERVER_PORT) + "\n\n";
+  msg += "Mode: AP\n";
+  msg += "IP: " + ip + "\nPort: " + String(SERVER_PORT) + "\n\n";
   msg += "API:\n";
   msg += "GET    /api/status\n";
   msg += "GET    /api/filelist\n";
@@ -331,12 +311,12 @@ void handleStatus()
   else if (cardType == CARD_SD)    card = "SDSC";
   else if (cardType == CARD_SDHC)  card = "SDHC/SDXC";
 
-  String ip = (currentMode == MODE_STA) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String ip = WiFi.softAPIP().toString();
 
   String json = "{";
   json += "\"ok\":true,";
   json += "\"board\":\"ESP32-S3\",";
-  json += "\"wifi_mode\":\"" + String(currentMode == MODE_STA ? "STA" : "AP") + "\",";
+  json += "\"wifi_mode\":\"AP\",";
   json += "\"ip\":\"" + ip + "\",";
   json += "\"port\":" + String(SERVER_PORT) + ",";
   json += "\"ap_ssid\":\"" + jsonEscape(String(AP_SSID)) + "\",";
@@ -357,7 +337,6 @@ void handleStatus()
   json += "\"id_thiet_bi\":\"" + jsonEscape(String(dinhDanh.id_thiet_bi)) + "\",";
   json += "\"dia_chi_thiet_bi\":\"" + jsonEscape(String(dinhDanh.dia_chi_thiet_bi)) + "\"";
   json += "}}";
-
 
   server.send(200, "application/json", json);
 }
@@ -733,7 +712,6 @@ void handleFileUploadAll()
   }
 }
 
-// ================== WIFI SWITCHING ==================
 void handleDeviceInfo()
 {
   String json = "{\"ok\":true,";
@@ -742,122 +720,219 @@ void handleDeviceInfo()
   server.send(200, "application/json", json);
 }
 
-void notifyTrustedHost()
-{
-  String ip = WiFi.localIP().toString();
-  String gw = WiFi.gatewayIP().toString();
-  String payload = "{\"ip\":\"" + ip + "\",\"type\":\"PhantomR3b\"}";
-  String url = "http://" + gw + ":" + String(SERVER_PORT) + "/api/device/connection";
-
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(payload);
-  Serial.printf("[NOTIFY] POST %s -> %d\n", url.c_str(), code);
-  http.end();
-}
-void startAP()
-{
-  server.stop();
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true);
-  delay(300);
-  ledAllOff();
-
-  WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.softAPConfig(local_IP, gateway, subnet);
-  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
-
-  currentMode = MODE_AP;
-  lastClientCount = 0;
-  Serial.printf("[WIFI] AP: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-  server.begin();
-}
-
-bool connectToTrusted()
-{
-  server.stop();
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true);
-  delay(300);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("PhantomR3b");
-  WiFi.setSleep(false);
-  WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
-
-  Serial.printf("[WIFI] Dang ket noi %s...\n", TRUSTED_SSID);
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    if (millis() - t > STA_CONNECT_TIMEOUT_MS)
-    {
-      Serial.println("[WIFI] Ket noi that bai, quay ve AP.");
-      startAP();
-      return false;
-    }
-    delay(200);
-  }
-
-  currentMode = MODE_STA;
-  Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
-  notifyTrustedHost();
-  server.begin();
-  return true;
-}
-
-void doWifiScan()
-{
-  Serial.println("[SCAN] Quet WiFi tim trusted AP...");
-  int n = WiFi.scanNetworks(false, true);
-  bool found = false;
-
-  for (int i = 0; i < n; i++)
-  {
-    if (WiFi.SSID(i) == TRUSTED_SSID)
-    {
-      found = true;
-      break;
-    }
-  }
-  WiFi.scanDelete();
-
-  if (found)
-  {
-    Serial.println("[SCAN] Tim thay trusted AP, chuyen sang STA.");
-    connectToTrusted();
-  }
-  else
-  {
-    Serial.println("[SCAN] Khong tim thay, giu AP.");
-  }
-}
-
-void checkSTAConnection()
-{
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println("[WIFI] Mat ket noi STA, quay ve AP.");
-    startAP();
-  }
-}
-
 void handleNotFound()
 {
   String json = "{\"ok\":false,\"error\":\"not_found\",\"uri\":\"" + jsonEscape(server.uri()) + "\"}";
   server.send(404, "application/json", json);
 }
 
+// ================== SERIAL COM PROTOCOL ==================
+// Giao thuc text qua COM:
+//   LIST\n              -> JSON danh sach file trong /uploads
+//   STATUS\n            -> JSON thong tin SD + dinhDanh
+//   DELETE:ten_file\n   -> OK:ten_file\n hoac ERR:ly_do\n
+//   DELETE_ALL\n        -> OK:N\n hoac ERR:ly_do\n
+//   DOWNLOAD:ten_file\n -> SIZE:N\n + N bytes raw + DONE\n
+//   UPLOAD:ten_file:N\n -> (PC gui N bytes) -> OK:ten_file\n hoac ERR:ly_do\n
+//   PING\n              -> PONG\n
+
+String serialBuildFileList()
+{
+  File dir = SD.open("/uploads");
+  if (!dir || !dir.isDirectory())
+    return "{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}";
+
+  String json = "{\"ok\":true,\"dir\":\"/uploads\",\"files\":[";
+  bool first = true;
+
+  while (true)
+  {
+    File file = dir.openNextFile();
+    if (!file) break;
+    if (!file.isDirectory())
+    {
+      String fullName = String(file.name());
+      int slash = fullName.lastIndexOf('/');
+      String name = (slash >= 0) ? fullName.substring(slash + 1) : fullName;
+      uint64_t size = file.size();
+      if (!first) json += ",";
+      first = false;
+      json += "{\"name\":\"" + jsonEscape(name) + "\",";
+      json += "\"size\":" + String((unsigned long long)size) + ",";
+      json += "\"size_human\":\"" + humanSize(size) + "\"}";
+    }
+    file.close();
+  }
+  dir.close();
+  json += "]}";
+  return json;
+}
+
+String serialBuildStatus()
+{
+  uint8_t cardType = SD.cardType();
+  String card = "UNKNOWN";
+  if (cardType == CARD_NONE)       card = "NONE";
+  else if (cardType == CARD_MMC)   card = "MMC";
+  else if (cardType == CARD_SD)    card = "SDSC";
+  else if (cardType == CARD_SDHC)  card = "SDHC/SDXC";
+
+  String json = "{\"ok\":true,\"board\":\"ESP32-S3\",";
+  json += "\"mac\":\"" + WiFi.macAddress() + "\",";
+  json += "\"sd_card_type\":\"" + card + "\",";
+  json += "\"sd_spi_hz\":" + String((unsigned long)mountedSDFreq) + ",";
+  json += "\"sd_total\":" + String((unsigned long long)getTotalBytes()) + ",";
+  json += "\"sd_used\":" + String((unsigned long long)getUsedBytes()) + ",";
+  json += "\"sd_total_human\":\"" + humanSize(getTotalBytes()) + "\",";
+  json += "\"sd_used_human\":\"" + humanSize(getUsedBytes()) + "\",";
+  json += "\"dinh_danh\":{";
+  json += "\"ma_id\":\"" + jsonEscape(dinhDanh.ma_id) + "\",";
+  json += "\"ho_ten\":\"" + jsonEscape(dinhDanh.ho_ten) + "\",";
+  json += "\"nam_sinh\":" + String(dinhDanh.nam_sinh) + ",";
+  json += "\"dia_chi\":\"" + jsonEscape(dinhDanh.dia_chi) + "\",";
+  json += "\"ten_thiet_bi\":\"" + jsonEscape(dinhDanh.ten_thiet_bi) + "\",";
+  json += "\"id_thiet_bi\":\"" + jsonEscape(dinhDanh.id_thiet_bi) + "\"";
+  json += "}}";
+  return json;
+}
+
+void handleSerialCommands()
+{
+  if (!Serial.available()) return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  // PING
+  if (cmd == "PING") {
+    Serial.println("PONG");
+    return;
+  }
+
+  // LIST
+  if (cmd == "LIST") {
+    Serial.println(serialBuildFileList());
+    return;
+  }
+
+  // STATUS
+  if (cmd == "STATUS") {
+    Serial.println(serialBuildStatus());
+    return;
+  }
+
+  // DELETE_ALL
+  if (cmd == "DELETE_ALL") {
+    File dir = SD.open("/uploads");
+    if (!dir || !dir.isDirectory()) { Serial.println("ERR:cannot_open_uploads_dir"); return; }
+    uint32_t del = 0;
+    while (true) {
+      File f = dir.openNextFile();
+      if (!f) break;
+      if (!f.isDirectory()) {
+        String fn = String(f.name());
+        int sl = fn.lastIndexOf('/');
+        String nm = (sl >= 0) ? fn.substring(sl + 1) : fn;
+        f.close();
+        if (SD.remove("/uploads/" + nm)) del++;
+      } else { f.close(); }
+    }
+    dir.close();
+    Serial.println("OK:" + String(del));
+    return;
+  }
+
+  // DELETE:filename
+  if (cmd.startsWith("DELETE:")) {
+    String name = safeFileName(cmd.substring(7));
+    if (name.length() == 0) { Serial.println("ERR:missing_name"); return; }
+    String path = "/uploads/" + name;
+    if (!SD.exists(path)) { Serial.println("ERR:file_not_found"); return; }
+    if (SD.remove(path)) Serial.println("OK:" + name);
+    else                 Serial.println("ERR:delete_failed");
+    return;
+  }
+
+  // DOWNLOAD:filename
+  if (cmd.startsWith("DOWNLOAD:")) {
+    String name = safeFileName(cmd.substring(9));
+    if (name.length() == 0) { Serial.println("ERR:missing_name"); return; }
+    String path = "/uploads/" + name;
+    if (!SD.exists(path)) { Serial.println("ERR:file_not_found"); return; }
+    File f = SD.open(path, FILE_READ);
+    if (!f) { Serial.println("ERR:cannot_open_file"); return; }
+    uint64_t sz = f.size();
+    Serial.println("SIZE:" + String((unsigned long long)sz));
+    uint8_t buf[SERIAL_UPLOAD_CHUNK];
+    while (f.available()) {
+      int n = f.read(buf, SERIAL_UPLOAD_CHUNK);
+      if (n > 0) Serial.write(buf, n);
+    }
+    f.close();
+    Serial.println("DONE");
+    return;
+  }
+
+  // UPLOAD:filename:size
+  if (cmd.startsWith("UPLOAD:")) {
+    String rest = cmd.substring(7);
+    int colon = rest.lastIndexOf(':');
+    if (colon < 1) { Serial.println("ERR:bad_command"); return; }
+    String name = safeFileName(rest.substring(0, colon));
+    uint32_t size = rest.substring(colon + 1).toInt();
+    if (name.length() == 0 || size == 0) { Serial.println("ERR:bad_command"); return; }
+
+    if (!ensureUploadDir()) { Serial.println("ERR:cannot_create_uploads_dir"); return; }
+    String path = "/uploads/" + name;
+    if (SD.exists(path)) SD.remove(path);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { Serial.println("ERR:cannot_open_file_for_write"); return; }
+
+    Serial.println("READY");
+
+    uint32_t received = 0;
+    uint8_t buf[SERIAL_UPLOAD_CHUNK];
+    unsigned long lastRecv = millis();
+
+    while (received < size) {
+      if (millis() - lastRecv > SERIAL_CMD_TIMEOUT_MS) {
+        f.close();
+        SD.remove(path);
+        Serial.println("ERR:timeout");
+        return;
+      }
+      int avail = Serial.available();
+      if (avail <= 0) continue;
+      uint32_t need = size - received;
+      int toRead = (avail < (int)SERIAL_UPLOAD_CHUNK) ? avail : SERIAL_UPLOAD_CHUNK;
+      if ((uint32_t)toRead > need) toRead = (int)need;
+      int n = Serial.readBytes(buf, toRead);
+      if (n > 0) {
+        f.write(buf, n);
+        received += n;
+        lastRecv = millis();
+      }
+    }
+    f.flush();
+    f.close();
+    startUploadBlinkWhite();
+    Serial.println("OK:" + name);
+    Serial.printf("[SERIAL] Upload OK: %s %lu bytes\n", name.c_str(), (unsigned long)received);
+    return;
+  }
+
+  Serial.println("ERR:unknown_command");
+}
+
 // ================== SETUP ==================
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD);
   delay(1500);
 
   Serial.println();
-  Serial.println("=== ESP32-S3 microSD WIFI SERVER ===");
+  Serial.println("=== ESP32-S3 microSD SERVER (AP+COM) ===");
 
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_GREEN, OUTPUT);
@@ -893,62 +968,19 @@ void setup()
   Serial.printf("[SD] Total: %s  Used: %s\n",
     humanSize(SD.totalBytes()).c_str(), humanSize(SD.usedBytes()).c_str());
 
-  Serial.println("[WIFI] Quet WiFi tim trusted AP...");
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("PhantomR3b");
-  int n = WiFi.scanNetworks(false, true);
-  bool trustedFound = false;
-  for (int i = 0; i < n; i++)
+  Serial.println("[WIFI] Khoi dong AP...");
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN))
   {
-    if (WiFi.SSID(i) == TRUSTED_SSID)
-    {
-      trustedFound = true;
-      break;
-    }
+    Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
+    while (true) { ledRed(true); delay(500); ledRed(false); delay(500); }
   }
-  WiFi.scanDelete();
-
-  if (trustedFound)
-  {
-    Serial.println("[WIFI] Tim thay trusted AP, ket noi STA...");
-    WiFi.setSleep(false);
-    WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
-    unsigned long t = millis();
-    bool connected = false;
-    while (millis() - t < STA_CONNECT_TIMEOUT_MS)
-    {
-      if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
-      delay(200);
-    }
-    if (connected)
-    {
-      currentMode = MODE_STA;
-      ledRed(false);
-      Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
-      notifyTrustedHost();
-    }
-    else
-    {
-      Serial.println("[WIFI] Ket noi STA that bai, chuyen sang AP.");
-    }
-  }
-
-  if (currentMode != MODE_STA)
-  {
-    Serial.println("[WIFI] Cau hinh IP AP...");
-    WiFi.mode(WIFI_AP);
-    WiFi.setSleep(false);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    WiFi.softAPConfig(local_IP, gateway, subnet);
-    if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN))
-    {
-      Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
-      while (true) { ledRed(true); delay(500); ledRed(false); delay(500); }
-    }
-    ledRed(false);
-    Serial.printf("[WIFI] SSID: %s  IP: %s  PORT: %d\n",
-      AP_SSID, WiFi.softAPIP().toString().c_str(), SERVER_PORT);
-  }
+  ledRed(false);
+  Serial.printf("[WIFI] AP SSID: %s  IP: %s  PORT: %d\n",
+    AP_SSID, WiFi.softAPIP().toString().c_str(), SERVER_PORT);
 
   setWifiLedByClient();
 
@@ -975,9 +1007,9 @@ void setup()
   server.onNotFound(handleNotFound);
 
   server.begin();
-  lastScanMs = millis();
 
-  Serial.println("[HTTP] Server started");
+  Serial.println("[HTTP] WiFi AP server started");
+  Serial.println("[COM]  Serial COM ready - giao thuc: LIST/STATUS/PING/DELETE/DOWNLOAD/UPLOAD");
   Serial.println("=== READY ===");
 }
 
@@ -986,16 +1018,5 @@ void loop()
 {
   server.handleClient();
   updateStatusLed();
-
-  unsigned long now = millis();
-
-  if (currentMode == MODE_STA)
-  {
-    checkSTAConnection();
-  }
-  else if (now - lastScanMs >= SCAN_INTERVAL_MS)
-  {
-    lastScanMs = now;
-    doWifiScan();
-  }
+  handleSerialCommands();
 }
