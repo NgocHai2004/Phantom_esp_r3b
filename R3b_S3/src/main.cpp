@@ -285,21 +285,173 @@ void updateStatusLed()
 }
 
 // ================== API HANDLERS (WiFi AP) ==================
+static const char GUI_HTML[] PROGMEM = R"HTMLEND(<!DOCTYPE html>
+<html lang="vi"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-S3 Phantom</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0}
+header{background:#16213e;padding:12px 20px;font-size:1.1em;font-weight:bold;color:#e94560}
+.tabs{display:flex;background:#16213e;border-bottom:2px solid #e94560}
+.tab{padding:10px 22px;cursor:pointer;color:#aaa;font-size:.9em}
+.tab.active{color:#e94560;border-bottom:2px solid #e94560;margin-bottom:-2px}
+.content{display:none;padding:16px}
+.content.active{display:block}
+.card{background:#16213e;border-radius:8px;padding:16px;margin-bottom:14px}
+h3{color:#e94560;margin-bottom:10px}
+label{display:block;font-size:.78em;color:#aaa;margin:8px 0 3px}
+input[type=text],input[type=number]{width:100%;padding:7px 10px;background:#0f3460;border:1px solid #333;border-radius:4px;color:#fff;font-size:.9em}
+button{padding:7px 16px;border:none;border-radius:4px;cursor:pointer;font-size:.85em}
+.bp{background:#e94560;color:#fff}.bi{background:#2980b9;color:#fff}.bs{background:#27ae60;color:#fff}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.msg{margin-top:10px;padding:7px 10px;border-radius:4px;font-size:.82em;min-height:28px}
+.ok{background:#1e4d2b;color:#2ecc71}.er{background:#4d1e1e;color:#e74c3c}
+table{width:100%;border-collapse:collapse;font-size:.83em}
+th{text-align:left;padding:7px 8px;background:#0f3460;color:#aaa}
+td{padding:7px 8px;border-bottom:1px solid #2a2a3e;word-break:break-all}
+.dz{border:2px dashed #e94560;border-radius:8px;padding:28px;text-align:center;cursor:pointer;color:#888;font-size:.9em;transition:.2s}
+.dz.ov{background:#0f3460;color:#fff}
+progress{width:100%;margin-top:8px;height:6px;display:none}
+a{color:#2980b9;text-decoration:none}a:hover{text-decoration:underline}
+</style></head>
+<body>
+<header>&#9889; ESP32-S3 Phantom</header>
+<div class="tabs">
+  <div class="tab active" id="t-dd" onclick="showTab('dd')">&#128100; Định Danh</div>
+  <div class="tab" id="t-files" onclick="showTab('files')">&#128193; Files</div>
+</div>
+
+<div id="dd" class="content active">
+  <div class="card">
+    <h3>Thông Tin Định Danh</h3>
+    <label>Mã ID</label><input id="ma_id" type="text">
+    <label>Họ Tên</label><input id="ho_ten" type="text">
+    <label>Năm Sinh</label><input id="nam_sinh" type="number" min="1900" max="2100">
+    <label>Địa Chỉ</label><input id="dia_chi" type="text">
+    <label>Ngày Cấp Định Danh</label><input id="ngay_cap_dinh_danh" type="text" placeholder="YYYY-MM-DD">
+    <label>Tên Thiết Bị</label><input id="ten_thiet_bi" type="text">
+    <label>ID Thiết Bị</label><input id="id_thiet_bi" type="text">
+    <label>Địa Chỉ Thiết Bị</label><input id="dia_chi_thiet_bi" type="text">
+    <div class="row">
+      <button class="bi" onclick="loadDD()">&#8635; Tải Lại</button>
+      <button class="bp" onclick="saveDD()">&#128190; Lưu</button>
+    </div>
+    <div id="dd-msg" class="msg"></div>
+  </div>
+</div>
+
+<div id="files" class="content">
+  <div class="card">
+    <h3>&#8679; Upload File</h3>
+    <div class="dz" id="dz" onclick="document.getElementById('fu').click()"
+      ondragover="event.preventDefault();this.classList.add('ov')"
+      ondragleave="this.classList.remove('ov')"
+      ondrop="onDrop(event)">
+      Kéo thả file vào đây hoặc <b>click</b> để chọn
+    </div>
+    <input type="file" id="fu" style="display:none" onchange="uploadFile(this.files)">
+    <progress id="uprog" value="0" max="100"></progress>
+    <div id="up-msg" class="msg"></div>
+  </div>
+  <div class="card">
+    <div class="row" style="justify-content:space-between;align-items:center;margin-top:0">
+      <h3 style="margin:0">&#128193; Danh Sách /uploads</h3>
+      <button class="bi" onclick="loadFiles()">&#8635; Tải Lại</button>
+    </div>
+    <table style="margin-top:10px">
+      <thead><tr><th>Tên File</th><th>Kích Thước</th><th>Thao Tác</th></tr></thead>
+      <tbody id="ftbl"><tr><td colspan="3" style="text-align:center;color:#555">Đang tải...</td></tr></tbody>
+    </table>
+    <div id="fl-msg" class="msg"></div>
+  </div>
+</div>
+
+<script>
+var activeTab='dd';
+function showTab(t){
+  document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
+  document.querySelectorAll('.content').forEach(e=>e.classList.remove('active'));
+  document.getElementById(t).classList.add('active');
+  document.getElementById('t-'+t).classList.add('active');
+  activeTab=t;
+  if(t==='files') loadFiles();
+  if(t==='dd') loadDD();
+}
+function setMsg(id,txt,ok){
+  var el=document.getElementById(id);
+  el.className='msg '+(ok?'ok':'er');
+  el.textContent=txt;
+  if(ok) setTimeout(()=>{el.textContent='';el.className='msg';},4000);
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function loadDD(){
+  fetch('/api/dinh-danh').then(r=>r.json()).then(d=>{
+    if(!d.ok){setMsg('dd-msg','Lỗi: '+d.error,false);return;}
+    ['ma_id','ho_ten','nam_sinh','dia_chi','ngay_cap_dinh_danh','ten_thiet_bi','id_thiet_bi','dia_chi_thiet_bi']
+      .forEach(k=>{var el=document.getElementById(k);if(el)el.value=d[k]!=null?d[k]:'';});
+    setMsg('dd-msg','Đã tải dữ liệu',true);
+  }).catch(()=>setMsg('dd-msg','Không kết nối được',false));
+}
+function saveDD(){
+  var data={nam_sinh:parseInt(document.getElementById('nam_sinh').value)||0};
+  ['ma_id','ho_ten','dia_chi','ngay_cap_dinh_danh','ten_thiet_bi','id_thiet_bi','dia_chi_thiet_bi']
+    .forEach(k=>data[k]=document.getElementById(k).value);
+  fetch('/api/dinh-danh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok) setMsg('dd-msg','Đã lưu thành công!',true);
+      else setMsg('dd-msg','Lỗi: '+d.error,false);
+    }).catch(()=>setMsg('dd-msg','Không kết nối được',false));
+}
+
+function loadFiles(){
+  fetch('/api/filelist').then(r=>r.json()).then(d=>{
+    var tb=document.getElementById('ftbl');
+    if(!d.ok){tb.innerHTML='<tr><td colspan="3" style="color:#e74c3c">'+esc(d.error)+'</td></tr>';return;}
+    if(!d.files||!d.files.length){
+      tb.innerHTML='<tr><td colspan="3" style="text-align:center;color:#555">Không có file nào</td></tr>';return;
+    }
+    tb.innerHTML=d.files.map(f=>'<tr><td>'+esc(f.name)+'</td><td>'+esc(f.size_human)+'</td>'
+      +'<td><a href="/api/download?name='+encodeURIComponent(f.name)+'">&#8681; Tải xuống</a></td></tr>').join('');
+  }).catch(()=>setMsg('fl-msg','Không kết nối được',false));
+}
+
+function onDrop(e){
+  e.preventDefault();
+  document.getElementById('dz').classList.remove('ov');
+  uploadFile(e.dataTransfer.files);
+}
+function uploadFile(files){
+  if(!files||!files.length) return;
+  var fd=new FormData();
+  fd.append('file',files[0]);
+  var prog=document.getElementById('uprog');
+  prog.style.display='block'; prog.value=0;
+  setMsg('up-msg','Đang upload...', true);
+  var xhr=new XMLHttpRequest();
+  xhr.upload.onprogress=function(e){if(e.lengthComputable)prog.value=e.loaded/e.total*100;};
+  xhr.onload=function(){
+    prog.style.display='none';
+    document.getElementById('fu').value='';
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(d.ok){setMsg('up-msg','OK: '+esc(d.name)+' ('+esc(d.size_human)+')',true);loadFiles();}
+      else setMsg('up-msg','Lỗi: '+esc(d.error),false);
+    }catch(e){setMsg('up-msg','Upload lỗi',false);}
+  };
+  xhr.onerror=function(){prog.style.display='none';setMsg('up-msg','Không kết nối được',false);};
+  xhr.open('POST','/api/upload');
+  xhr.send(fd);
+}
+loadDD();
+</script>
+</body></html>
+)HTMLEND";
+
 void handleRoot()
 {
-  String ip = WiFi.softAPIP().toString();
-  String msg = "ESP32-S3 microSD WiFi Server\n";
-  msg += "Mode: AP\n";
-  msg += "IP: " + ip + "\nPort: " + String(SERVER_PORT) + "\n\n";
-  msg += "API:\n";
-  msg += "GET    /api/status\n";
-  msg += "GET    /api/filelist\n";
-  msg += "POST   /api/upload     form-data key=file\n";
-  msg += "POST   /api/upload-all form-data key=files\n";
-  msg += "GET    /api/download?name=filename.bin\n";
-  msg += "DELETE /api/delete?name=filename.bin\n";
-  msg += "DELETE /api/delete-all\n";
-  server.send(200, "text/plain", msg);
+  server.send_P(200, "text/html; charset=utf-8", GUI_HTML);
 }
 
 void handleStatus()
