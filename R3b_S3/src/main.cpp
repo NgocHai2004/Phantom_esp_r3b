@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
@@ -33,21 +34,42 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
+// ================== TRUSTED WIFI CONFIG ==================
+#define TRUSTED_SSID "7068616e746f6d303030303030300001"
+#define TRUSTED_PASS "12345678"
+#define SCAN_INTERVAL_MS 10000UL
+#define STA_CONNECT_TIMEOUT_MS 10000UL
 #define AP_CHANNEL 1
 #define AP_HIDDEN true
 #define AP_MAX_CONN 2
 
-// ================== SERIAL COM CONFIG ==================
-#define SERIAL_BAUD 115200
-#define SERIAL_CMD_TIMEOUT_MS 5000UL
-#define SERIAL_UPLOAD_CHUNK 512
-
 // ================== LED STATE ==================
-bool uploadLedActive = false;
-unsigned long uploadLedUntilMs = 0;
-const uint16_t UPLOAD_LED_HOLD_MS = 500;
+// Quy ước LED: mỗi thời điểm chỉ có 1 trạng thái màu rõ ràng.
+// VÀNG  = chưa kết nối / đang chờ / vừa lên nguồn
+// XANH  = đúng 1 kết nối qua WiFi hoặc USB CDC
+// ĐỎ    = có từ 2 kết nối trở lên / thiết bị khác đang kết nối thêm
+// TRẮNG = đang truyền file upload/download
+enum LedState
+{
+  LED_STATE_IDLE,         // Vàng
+  LED_STATE_CONNECTED,    // Xanh
+  LED_STATE_MULTI_CLIENT, // Đỏ
+  LED_STATE_TRANSFER,     // Trắng
+  LED_STATE_ERROR         // Đỏ nháy, dùng trong vòng lặp lỗi
+};
 
+volatile LedState g_ledState = LED_STATE_IDLE;
+bool transferLedActive = false;
 uint8_t lastClientCount = 0;
+
+// ================== WIFI MODE STATE ==================
+enum WifiMode
+{
+  MODE_AP,
+  MODE_STA
+};
+WifiMode currentMode = MODE_AP;
+unsigned long lastScanMs = 0;
 
 // ================== UPLOAD STATE ==================
 File uploadFile;
@@ -56,6 +78,26 @@ String uploadFilePath = "";
 bool uploadOK = false;
 String uploadError = "";
 uint64_t uploadBytes = 0;
+
+// ── serial chunked upload state ──────────────────────────────────────────────
+File _serialUpFile;
+String _serialUpName = "";
+size_t _serialUpTotal = 0;
+size_t _serialUpWritten = 0;
+
+// Serial upload: decode từng chunk nhỏ rồi ghi thẳng xuống SD.
+// Không cấp phát RAM theo kích thước file/chunk nữa.
+#define SERIAL_B64_MAX_LEN 12288    // base64 tối đa mỗi dòng JSON (~9KB dữ liệu gốc)
+#define SERIAL_DECODE_BUF_SIZE 9216 // buffer decode cố định
+static uint8_t _serialDecodeBuf[SERIAL_DECODE_BUF_SIZE];
+
+// ── serial chunked download state ────────────────────────────────────────────
+File _serialDownFile;
+String _serialDownName = "";
+size_t _serialDownSize = 0;
+size_t _serialDownRead = 0;
+uint32_t _serialDownChunks = 0;
+#define SERIAL_DOWN_CHUNK 12288 // bytes per chunk → base64 ~16384 chars
 
 // ================== UPLOAD ALL STATE ==================
 bool uploadAllActive = false;
@@ -95,79 +137,112 @@ String jsonEscape(const String &s)
 }
 
 // ================== DINH DANH ==================
-struct DinhDanh {
-  String ma_id              = "BN-0001";
-  String ho_ten             = "Nguyen Van A";
-  int    nam_sinh           = 1990;
-  String dia_chi            = "Ha Noi";
+struct DinhDanh
+{
+  String ma_id = "BN-0001";
+  String ho_ten = "Nguyen Van A";
+  int nam_sinh = 1990;
+  String dia_chi = "Ha Noi";
   String ngay_cap_dinh_danh = "2026-05-30";
-  String ten_thiet_bi       = "Pi Zero 2W";
-  String id_thiet_bi        = "DEVICE-0001";
-  String dia_chi_thiet_bi   = "Ha Noi";
+  String ten_thiet_bi = "Pi Zero 2W";
+  String id_thiet_bi = "DEVICE-0001";
+  String dia_chi_thiet_bi = "Ha Noi";
 };
 
 DinhDanh dinhDanh;
 
-static String _jStr(const String &j, const String &key) {
+static String _jStr(const String &j, const String &key)
+{
   int p = j.indexOf("\"" + key + "\"");
-  if (p < 0) return "";
+  if (p < 0)
+    return "";
   p = j.indexOf(':', p + key.length() + 2);
-  if (p < 0) return "";
+  if (p < 0)
+    return "";
   p++;
-  while (p < (int)j.length() && (j[p] == ' ' || j[p] == '\t')) p++;
-  if (j[p] != '"') return "";
+  while (p < (int)j.length() && (j[p] == ' ' || j[p] == '\t'))
+    p++;
+  if (j[p] != '"')
+    return "";
   p++;
   String v = "";
-  while (p < (int)j.length() && j[p] != '"') {
-    if (j[p] == '\\' && p + 1 < (int)j.length()) { p++; v += j[p]; }
-    else v += j[p];
+  while (p < (int)j.length() && j[p] != '"')
+  {
+    if (j[p] == '\\' && p + 1 < (int)j.length())
+    {
+      p++;
+      v += j[p];
+    }
+    else
+      v += j[p];
     p++;
   }
   return v;
 }
 
-static int _jInt(const String &j, const String &key) {
+static int _jInt(const String &j, const String &key)
+{
   int p = j.indexOf("\"" + key + "\"");
-  if (p < 0) return -1;
+  if (p < 0)
+    return -1;
   p = j.indexOf(':', p + key.length() + 2);
-  if (p < 0) return -1;
+  if (p < 0)
+    return -1;
   p++;
-  while (p < (int)j.length() && (j[p] == ' ' || j[p] == '\t')) p++;
+  while (p < (int)j.length() && (j[p] == ' ' || j[p] == '\t'))
+    p++;
   String v = "";
-  while (p < (int)j.length() && j[p] >= '0' && j[p] <= '9') v += j[p++];
+  while (p < (int)j.length() && j[p] >= '0' && j[p] <= '9')
+    v += j[p++];
   return v.length() ? v.toInt() : -1;
 }
 
-void loadDinhDanhFromSD() {
+void loadDinhDanhFromSD()
+{
   File f = SD.open("/dinh_danh.json", FILE_READ);
-  if (!f) { Serial.println("[DD] dinh_danh.json not found, using defaults"); return; }
+  if (!f)
+  {
+    Serial.println("[DD] dinh_danh.json not found, using defaults");
+    return;
+  }
   String c = "";
-  while (f.available()) c += (char)f.read();
+  while (f.available())
+    c += (char)f.read();
   f.close();
   String v;
-  int    n;
-  if ((v = _jStr(c, "ma_id")).length())              dinhDanh.ma_id              = v;
-  if ((v = _jStr(c, "ho_ten")).length())             dinhDanh.ho_ten             = v;
-  if ((n = _jInt(c, "nam_sinh")) >= 0)               dinhDanh.nam_sinh           = n;
-  if ((v = _jStr(c, "dia_chi")).length())            dinhDanh.dia_chi            = v;
-  if ((v = _jStr(c, "ngay_cap_dinh_danh")).length()) dinhDanh.ngay_cap_dinh_danh = v;
-  if ((v = _jStr(c, "ten_thiet_bi")).length())       dinhDanh.ten_thiet_bi       = v;
-  if ((v = _jStr(c, "id_thiet_bi")).length())        dinhDanh.id_thiet_bi        = v;
-  if ((v = _jStr(c, "dia_chi_thiet_bi")).length())   dinhDanh.dia_chi_thiet_bi   = v;
+  int n;
+  if ((v = _jStr(c, "ma_id")).length())
+    dinhDanh.ma_id = v;
+  if ((v = _jStr(c, "ho_ten")).length())
+    dinhDanh.ho_ten = v;
+  if ((n = _jInt(c, "nam_sinh")) >= 0)
+    dinhDanh.nam_sinh = n;
+  if ((v = _jStr(c, "dia_chi")).length())
+    dinhDanh.dia_chi = v;
+  if ((v = _jStr(c, "ngay_cap_dinh_danh")).length())
+    dinhDanh.ngay_cap_dinh_danh = v;
+  if ((v = _jStr(c, "ten_thiet_bi")).length())
+    dinhDanh.ten_thiet_bi = v;
+  if ((v = _jStr(c, "id_thiet_bi")).length())
+    dinhDanh.id_thiet_bi = v;
+  if ((v = _jStr(c, "dia_chi_thiet_bi")).length())
+    dinhDanh.dia_chi_thiet_bi = v;
   Serial.println("[DD] Loaded dinh_danh.json");
 }
 
-bool saveDinhDanhToSD() {
+bool saveDinhDanhToSD()
+{
   File f = SD.open("/dinh_danh.json", FILE_WRITE);
-  if (!f) return false;
+  if (!f)
+    return false;
   f.printf("{\n  \"ma_id\":\"%s\",\n  \"ho_ten\":\"%s\",\n  \"nam_sinh\":%d,\n"
            "  \"dia_chi\":\"%s\",\n  \"ngay_cap_dinh_danh\":\"%s\",\n"
            "  \"ten_thiet_bi\":\"%s\",\n  \"id_thiet_bi\":\"%s\",\n"
            "  \"dia_chi_thiet_bi\":\"%s\"\n}",
-    dinhDanh.ma_id.c_str(), dinhDanh.ho_ten.c_str(), dinhDanh.nam_sinh,
-    dinhDanh.dia_chi.c_str(), dinhDanh.ngay_cap_dinh_danh.c_str(),
-    dinhDanh.ten_thiet_bi.c_str(), dinhDanh.id_thiet_bi.c_str(),
-    dinhDanh.dia_chi_thiet_bi.c_str());
+           dinhDanh.ma_id.c_str(), dinhDanh.ho_ten.c_str(), dinhDanh.nam_sinh,
+           dinhDanh.dia_chi.c_str(), dinhDanh.ngay_cap_dinh_danh.c_str(),
+           dinhDanh.ten_thiet_bi.c_str(), dinhDanh.id_thiet_bi.c_str(),
+           dinhDanh.dia_chi_thiet_bi.c_str());
   f.close();
   return true;
 }
@@ -228,7 +303,7 @@ bool ensureUploadDir()
   return true;
 }
 
-uint64_t getUsedBytes()  { return SD.usedBytes(); }
+uint64_t getUsedBytes() { return SD.usedBytes(); }
 uint64_t getTotalBytes() { return SD.totalBytes(); }
 
 // ================== LED FUNCTIONS ==================
@@ -239,236 +314,167 @@ void ledAllOff()
   digitalWrite(LED_WHITE, LOW);
 }
 
-void ledRed(bool on)   { digitalWrite(LED_RED,   on ? HIGH : LOW); }
+void ledRed(bool on) { digitalWrite(LED_RED, on ? HIGH : LOW); }
 void ledGreen(bool on) { digitalWrite(LED_GREEN, on ? HIGH : LOW); }
 void ledWhite(bool on) { digitalWrite(LED_WHITE, on ? HIGH : LOW); }
-void ledPink(bool on)  { digitalWrite(LED_RED, on ? HIGH : LOW); digitalWrite(LED_WHITE, on ? HIGH : LOW); }
+
+void setLedState(LedState st)
+{
+  g_ledState = st;
+
+  // Tắt hết trước để đảm bảo không bị lẫn màu.
+  ledAllOff();
+
+  switch (st)
+  {
+  case LED_STATE_IDLE:
+    // Vàng = đỏ + xanh trên LED RGB.
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, HIGH);
+    break;
+
+  case LED_STATE_CONNECTED:
+    digitalWrite(LED_GREEN, HIGH);
+    break;
+
+  case LED_STATE_MULTI_CLIENT:
+    digitalWrite(LED_RED, HIGH);
+    break;
+
+  case LED_STATE_TRANSFER:
+    digitalWrite(LED_WHITE, HIGH);
+    break;
+
+  case LED_STATE_ERROR:
+  default:
+    digitalWrite(LED_RED, HIGH);
+    break;
+  }
+}
+
+void setTransferLed(bool active)
+{
+  transferLedActive = active;
+  if (active)
+  {
+    setLedState(LED_STATE_TRANSFER);
+  }
+}
+
+bool isUsbSerialConnected()
+{
+#if ARDUINO_USB_CDC_ON_BOOT
+  return true;
+#else
+  return false;
+#endif
+}
+
+uint8_t getActiveConnectionCount()
+{
+  uint8_t count = 0;
+
+  // USB CDC từ app/bridge trên máy tính.
+  if (isUsbSerialConnected())
+    count++;
+
+  // WiFi AP: số client đang nối vào ESP32.
+  if (currentMode == MODE_AP)
+  {
+    count += WiFi.softAPgetStationNum();
+  }
+
+  // WiFi STA: ESP32 đang nối vào trusted WiFi cũng tính là 1 kết nối.
+  if (currentMode == MODE_STA && WiFi.status() == WL_CONNECTED)
+  {
+    count++;
+  }
+
+  return count;
+}
+
+void updateConnectionLed()
+{
+  if (transferLedActive)
+    return;
+
+  uint8_t totalConnections = getActiveConnectionCount();
+  lastClientCount = (currentMode == MODE_AP) ? WiFi.softAPgetStationNum() : 0;
+
+  if (totalConnections == 0)
+  {
+    setLedState(LED_STATE_IDLE); // Vàng
+  }
+  else if (totalConnections == 1)
+  {
+    setLedState(LED_STATE_CONNECTED); // Xanh
+  }
+  else
+  {
+    setLedState(LED_STATE_MULTI_CLIENT); // Đỏ
+  }
+}
+
+void endTransferLed()
+{
+  transferLedActive = false;
+  updateConnectionLed();
+}
+
+// Giữ tên hàm cũ để không phải đổi nhiều chỗ trong code.
+void startUploadBlinkWhite()
+{
+  setTransferLed(true);
+}
 
 void setWifiLedByClient()
 {
-  uint8_t clientCount = WiFi.softAPgetStationNum();
-  ledGreen(clientCount > 0);
-  lastClientCount = clientCount;
-}
-
-void startUploadBlinkWhite()
-{
-  unsigned long now = millis();
-  uploadLedActive = true;
-  if ((int32_t)(uploadLedUntilMs - now) <= 0)
-    uploadLedUntilMs = now + UPLOAD_LED_HOLD_MS;
-  else
-    uploadLedUntilMs += UPLOAD_LED_HOLD_MS;
-  ledWhite(true);
+  updateConnectionLed();
 }
 
 void updateStatusLed()
 {
-  unsigned long now = millis();
-
-  if (uploadLedActive)
-  {
-    if ((int32_t)(uploadLedUntilMs - now) > 0)
-    {
-      ledWhite(true);
-      return;
-    }
-    uploadLedActive = false;
-    ledWhite(false);
-    setWifiLedByClient();
-    return;
-  }
-
-  uint8_t clientCount = WiFi.softAPgetStationNum();
-  if (clientCount != lastClientCount)
-    setWifiLedByClient();
+  updateConnectionLed();
 }
 
-// ================== API HANDLERS (WiFi AP) ==================
-static const char GUI_HTML[] PROGMEM = R"HTMLEND(<!DOCTYPE html>
-<html lang="vi"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-S3 Phantom</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:sans-serif;background:#1a1a2e;color:#e0e0e0}
-header{background:#16213e;padding:12px 20px;font-size:1.1em;font-weight:bold;color:#e94560}
-.tabs{display:flex;background:#16213e;border-bottom:2px solid #e94560}
-.tab{padding:10px 22px;cursor:pointer;color:#aaa;font-size:.9em}
-.tab.active{color:#e94560;border-bottom:2px solid #e94560;margin-bottom:-2px}
-.content{display:none;padding:16px}
-.content.active{display:block}
-.card{background:#16213e;border-radius:8px;padding:16px;margin-bottom:14px}
-h3{color:#e94560;margin-bottom:10px}
-label{display:block;font-size:.78em;color:#aaa;margin:8px 0 3px}
-input[type=text],input[type=number]{width:100%;padding:7px 10px;background:#0f3460;border:1px solid #333;border-radius:4px;color:#fff;font-size:.9em}
-button{padding:7px 16px;border:none;border-radius:4px;cursor:pointer;font-size:.85em}
-.bp{background:#e94560;color:#fff}.bi{background:#2980b9;color:#fff}.bs{background:#27ae60;color:#fff}
-.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.msg{margin-top:10px;padding:7px 10px;border-radius:4px;font-size:.82em;min-height:28px}
-.ok{background:#1e4d2b;color:#2ecc71}.er{background:#4d1e1e;color:#e74c3c}
-table{width:100%;border-collapse:collapse;font-size:.83em}
-th{text-align:left;padding:7px 8px;background:#0f3460;color:#aaa}
-td{padding:7px 8px;border-bottom:1px solid #2a2a3e;word-break:break-all}
-.dz{border:2px dashed #e94560;border-radius:8px;padding:28px;text-align:center;cursor:pointer;color:#888;font-size:.9em;transition:.2s}
-.dz.ov{background:#0f3460;color:#fff}
-progress{width:100%;margin-top:8px;height:6px;display:none}
-a{color:#2980b9;text-decoration:none}a:hover{text-decoration:underline}
-</style></head>
-<body>
-<header>&#9889; ESP32-S3 Phantom</header>
-<div class="tabs">
-  <div class="tab active" id="t-dd" onclick="showTab('dd')">&#128100; Định Danh</div>
-  <div class="tab" id="t-files" onclick="showTab('files')">&#128193; Files</div>
-</div>
-
-<div id="dd" class="content active">
-  <div class="card">
-    <h3>Thông Tin Định Danh</h3>
-    <label>Mã ID</label><input id="ma_id" type="text">
-    <label>Họ Tên</label><input id="ho_ten" type="text">
-    <label>Năm Sinh</label><input id="nam_sinh" type="number" min="1900" max="2100">
-    <label>Địa Chỉ</label><input id="dia_chi" type="text">
-    <label>Ngày Cấp Định Danh</label><input id="ngay_cap_dinh_danh" type="text" placeholder="YYYY-MM-DD">
-    <label>Tên Thiết Bị</label><input id="ten_thiet_bi" type="text">
-    <label>ID Thiết Bị</label><input id="id_thiet_bi" type="text">
-    <label>Địa Chỉ Thiết Bị</label><input id="dia_chi_thiet_bi" type="text">
-    <div class="row">
-      <button class="bi" onclick="loadDD()">&#8635; Tải Lại</button>
-      <button class="bp" onclick="saveDD()">&#128190; Lưu</button>
-    </div>
-    <div id="dd-msg" class="msg"></div>
-  </div>
-</div>
-
-<div id="files" class="content">
-  <div class="card">
-    <h3>&#8679; Upload File</h3>
-    <div class="dz" id="dz" onclick="document.getElementById('fu').click()"
-      ondragover="event.preventDefault();this.classList.add('ov')"
-      ondragleave="this.classList.remove('ov')"
-      ondrop="onDrop(event)">
-      Kéo thả file vào đây hoặc <b>click</b> để chọn
-    </div>
-    <input type="file" id="fu" style="display:none" onchange="uploadFile(this.files)">
-    <progress id="uprog" value="0" max="100"></progress>
-    <div id="up-msg" class="msg"></div>
-  </div>
-  <div class="card">
-    <div class="row" style="justify-content:space-between;align-items:center;margin-top:0">
-      <h3 style="margin:0">&#128193; Danh Sách /uploads</h3>
-      <button class="bi" onclick="loadFiles()">&#8635; Tải Lại</button>
-    </div>
-    <table style="margin-top:10px">
-      <thead><tr><th>Tên File</th><th>Kích Thước</th><th>Thao Tác</th></tr></thead>
-      <tbody id="ftbl"><tr><td colspan="3" style="text-align:center;color:#555">Đang tải...</td></tr></tbody>
-    </table>
-    <div id="fl-msg" class="msg"></div>
-  </div>
-</div>
-
-<script>
-var activeTab='dd';
-function showTab(t){
-  document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
-  document.querySelectorAll('.content').forEach(e=>e.classList.remove('active'));
-  document.getElementById(t).classList.add('active');
-  document.getElementById('t-'+t).classList.add('active');
-  activeTab=t;
-  if(t==='files') loadFiles();
-  if(t==='dd') loadDD();
-}
-function setMsg(id,txt,ok){
-  var el=document.getElementById(id);
-  el.className='msg '+(ok?'ok':'er');
-  el.textContent=txt;
-  if(ok) setTimeout(()=>{el.textContent='';el.className='msg';},4000);
-}
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-
-function loadDD(){
-  fetch('/api/dinh-danh').then(r=>r.json()).then(d=>{
-    if(!d.ok){setMsg('dd-msg','Lỗi: '+d.error,false);return;}
-    ['ma_id','ho_ten','nam_sinh','dia_chi','ngay_cap_dinh_danh','ten_thiet_bi','id_thiet_bi','dia_chi_thiet_bi']
-      .forEach(k=>{var el=document.getElementById(k);if(el)el.value=d[k]!=null?d[k]:'';});
-    setMsg('dd-msg','Đã tải dữ liệu',true);
-  }).catch(()=>setMsg('dd-msg','Không kết nối được',false));
-}
-function saveDD(){
-  var data={nam_sinh:parseInt(document.getElementById('nam_sinh').value)||0};
-  ['ma_id','ho_ten','dia_chi','ngay_cap_dinh_danh','ten_thiet_bi','id_thiet_bi','dia_chi_thiet_bi']
-    .forEach(k=>data[k]=document.getElementById(k).value);
-  fetch('/api/dinh-danh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
-    .then(r=>r.json()).then(d=>{
-      if(d.ok) setMsg('dd-msg','Đã lưu thành công!',true);
-      else setMsg('dd-msg','Lỗi: '+d.error,false);
-    }).catch(()=>setMsg('dd-msg','Không kết nối được',false));
-}
-
-function loadFiles(){
-  fetch('/api/filelist').then(r=>r.json()).then(d=>{
-    var tb=document.getElementById('ftbl');
-    if(!d.ok){tb.innerHTML='<tr><td colspan="3" style="color:#e74c3c">'+esc(d.error)+'</td></tr>';return;}
-    if(!d.files||!d.files.length){
-      tb.innerHTML='<tr><td colspan="3" style="text-align:center;color:#555">Không có file nào</td></tr>';return;
-    }
-    tb.innerHTML=d.files.map(f=>'<tr><td>'+esc(f.name)+'</td><td>'+esc(f.size_human)+'</td>'
-      +'<td><a href="/api/download?name='+encodeURIComponent(f.name)+'">&#8681; Tải xuống</a></td></tr>').join('');
-  }).catch(()=>setMsg('fl-msg','Không kết nối được',false));
-}
-
-function onDrop(e){
-  e.preventDefault();
-  document.getElementById('dz').classList.remove('ov');
-  uploadFile(e.dataTransfer.files);
-}
-function uploadFile(files){
-  if(!files||!files.length) return;
-  var fd=new FormData();
-  fd.append('file',files[0]);
-  var prog=document.getElementById('uprog');
-  prog.style.display='block'; prog.value=0;
-  setMsg('up-msg','Đang upload...', true);
-  var xhr=new XMLHttpRequest();
-  xhr.upload.onprogress=function(e){if(e.lengthComputable)prog.value=e.loaded/e.total*100;};
-  xhr.onload=function(){
-    prog.style.display='none';
-    document.getElementById('fu').value='';
-    try{
-      var d=JSON.parse(xhr.responseText);
-      if(d.ok){setMsg('up-msg','OK: '+esc(d.name)+' ('+esc(d.size_human)+')',true);loadFiles();}
-      else setMsg('up-msg','Lỗi: '+esc(d.error),false);
-    }catch(e){setMsg('up-msg','Upload lỗi',false);}
-  };
-  xhr.onerror=function(){prog.style.display='none';setMsg('up-msg','Không kết nối được',false);};
-  xhr.open('POST','/api/upload');
-  xhr.send(fd);
-}
-loadDD();
-</script>
-</body></html>
-)HTMLEND";
-
+// ================== API HANDLERS ==================
 void handleRoot()
 {
-  server.send_P(200, "text/html; charset=utf-8", GUI_HTML);
+  String ip = (currentMode == MODE_STA) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String msg = "ESP32-S3 microSD WiFi Server\n";
+  msg += "Mode: ";
+  msg += (currentMode == MODE_STA) ? "STA" : "AP";
+  msg += "\nIP: " + ip + "\nPort: " + String(SERVER_PORT) + "\n\n";
+  msg += "API:\n";
+  msg += "GET    /api/status\n";
+  msg += "GET    /api/filelist\n";
+  msg += "POST   /api/upload     form-data key=file\n";
+  msg += "POST   /api/upload-all form-data key=files\n";
+  msg += "GET    /api/download?name=filename.bin\n";
+  msg += "DELETE /api/delete?name=filename.bin\n";
+  msg += "DELETE /api/delete-all\n";
+  server.send(200, "text/plain", msg);
 }
 
 void handleStatus()
 {
   uint8_t cardType = SD.cardType();
   String card = "UNKNOWN";
-  if (cardType == CARD_NONE)       card = "NONE";
-  else if (cardType == CARD_MMC)   card = "MMC";
-  else if (cardType == CARD_SD)    card = "SDSC";
-  else if (cardType == CARD_SDHC)  card = "SDHC/SDXC";
+  if (cardType == CARD_NONE)
+    card = "NONE";
+  else if (cardType == CARD_MMC)
+    card = "MMC";
+  else if (cardType == CARD_SD)
+    card = "SDSC";
+  else if (cardType == CARD_SDHC)
+    card = "SDHC/SDXC";
 
-  String ip = WiFi.softAPIP().toString();
+  String ip = (currentMode == MODE_STA) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
 
   String json = "{";
   json += "\"ok\":true,";
   json += "\"board\":\"ESP32-S3\",";
-  json += "\"wifi_mode\":\"AP\",";
+  json += "\"wifi_mode\":\"" + String(currentMode == MODE_STA ? "STA" : "AP") + "\",";
   json += "\"ip\":\"" + ip + "\",";
   json += "\"port\":" + String(SERVER_PORT) + ",";
   json += "\"ap_ssid\":\"" + jsonEscape(String(AP_SSID)) + "\",";
@@ -512,22 +518,32 @@ void handleGetDinhDanh()
 void handlePostDinhDanh()
 {
   String body = server.arg("plain");
-  if (body.length() == 0) {
+  if (body.length() == 0)
+  {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"empty body\"}");
     return;
   }
   String v;
-  int    n;
-  if ((v = _jStr(body, "ma_id")).length())              dinhDanh.ma_id              = v;
-  if ((v = _jStr(body, "ho_ten")).length())             dinhDanh.ho_ten             = v;
-  if ((n = _jInt(body, "nam_sinh")) >= 0)               dinhDanh.nam_sinh           = n;
-  if ((v = _jStr(body, "dia_chi")).length())            dinhDanh.dia_chi            = v;
-  if ((v = _jStr(body, "ngay_cap_dinh_danh")).length()) dinhDanh.ngay_cap_dinh_danh = v;
-  if ((v = _jStr(body, "ten_thiet_bi")).length())       dinhDanh.ten_thiet_bi       = v;
-  if ((v = _jStr(body, "id_thiet_bi")).length())        dinhDanh.id_thiet_bi        = v;
-  if ((v = _jStr(body, "dia_chi_thiet_bi")).length())   dinhDanh.dia_chi_thiet_bi   = v;
+  int n;
+  if ((v = _jStr(body, "ma_id")).length())
+    dinhDanh.ma_id = v;
+  if ((v = _jStr(body, "ho_ten")).length())
+    dinhDanh.ho_ten = v;
+  if ((n = _jInt(body, "nam_sinh")) >= 0)
+    dinhDanh.nam_sinh = n;
+  if ((v = _jStr(body, "dia_chi")).length())
+    dinhDanh.dia_chi = v;
+  if ((v = _jStr(body, "ngay_cap_dinh_danh")).length())
+    dinhDanh.ngay_cap_dinh_danh = v;
+  if ((v = _jStr(body, "ten_thiet_bi")).length())
+    dinhDanh.ten_thiet_bi = v;
+  if ((v = _jStr(body, "id_thiet_bi")).length())
+    dinhDanh.id_thiet_bi = v;
+  if ((v = _jStr(body, "dia_chi_thiet_bi")).length())
+    dinhDanh.dia_chi_thiet_bi = v;
 
-  if (!saveDinhDanhToSD()) {
+  if (!saveDinhDanhToSD())
+  {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"sd_write_failed\"}");
     return;
   }
@@ -549,7 +565,8 @@ void handleFileList()
   while (true)
   {
     File file = dir.openNextFile();
-    if (!file) break;
+    if (!file)
+      break;
 
     if (!file.isDirectory())
     {
@@ -558,7 +575,8 @@ void handleFileList()
       String name = (slash >= 0) ? fullName.substring(slash + 1) : fullName;
       uint64_t size = file.size();
 
-      if (!first) json += ",";
+      if (!first)
+        json += ",";
       first = false;
 
       json += "{";
@@ -578,7 +596,8 @@ void handleFileList()
 
 String getNameArg()
 {
-  if (!server.hasArg("name")) return "";
+  if (!server.hasArg("name"))
+    return "";
   return safeFileName(server.arg("name"));
 }
 
@@ -605,9 +624,11 @@ void handleDownload()
     return;
   }
 
+  setTransferLed(true);
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
   server.streamFile(file, "application/octet-stream");
   file.close();
+  endTransferLed();
 
   SD.remove(path);
   Serial.printf("[DOWNLOAD] Xoa file sau download: %s\n", name.c_str());
@@ -649,7 +670,8 @@ void handleDeleteAll()
   while (true)
   {
     File file = dir.openNextFile();
-    if (!file) break;
+    if (!file)
+      break;
 
     if (!file.isDirectory())
     {
@@ -689,7 +711,7 @@ void handleUploadResponse()
   else
   {
     server.send(500, "application/json",
-      "{\"ok\":false,\"error\":\"" + jsonEscape(uploadError) + "\"}");
+                "{\"ok\":false,\"error\":\"" + jsonEscape(uploadError) + "\"}");
   }
 }
 
@@ -706,12 +728,24 @@ void handleFileUpload()
     uploadFilePath = "/uploads/" + uploadFileName;
 
     Serial.printf("[UPLOAD] START %s\n", uploadFileName.c_str());
+    setTransferLed(true);
 
-    if (!ensureUploadDir()) { uploadError = "cannot_create_uploads_dir"; return; }
-    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+    if (!ensureUploadDir())
+    {
+      uploadError = "cannot_create_uploads_dir";
+      endTransferLed();
+      return;
+    }
+    if (SD.exists(uploadFilePath))
+      SD.remove(uploadFilePath);
 
     uploadFile = SD.open(uploadFilePath, FILE_WRITE);
-    if (!uploadFile) { uploadError = "cannot_open_file_for_write"; return; }
+    if (!uploadFile)
+    {
+      uploadError = "cannot_open_file_for_write";
+      endTransferLed();
+      return;
+    }
   }
   else if (upload.status == UPLOAD_FILE_WRITE)
   {
@@ -719,7 +753,8 @@ void handleFileUpload()
     {
       size_t written = uploadFile.write(upload.buf, upload.currentSize);
       uploadBytes += written;
-      if (written != upload.currentSize) uploadError = "sd_write_failed";
+      if (written != upload.currentSize)
+        uploadError = "sd_write_failed";
     }
     else
     {
@@ -728,27 +763,38 @@ void handleFileUpload()
   }
   else if (upload.status == UPLOAD_FILE_END)
   {
-    if (uploadFile) { uploadFile.flush(); uploadFile.close(); }
+    if (uploadFile)
+    {
+      uploadFile.flush();
+      uploadFile.close();
+    }
 
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
       startUploadBlinkWhite();
       Serial.printf("[UPLOAD] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
+      endTransferLed();
     }
     else
     {
-      if (uploadError.length() == 0) uploadError = "empty_upload";
-      if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+      if (uploadError.length() == 0)
+        uploadError = "empty_upload";
+      if (SD.exists(uploadFilePath))
+        SD.remove(uploadFilePath);
       Serial.printf("[UPLOAD] FAIL %s err=%s\n", uploadFileName.c_str(), uploadError.c_str());
+      endTransferLed();
     }
   }
   else if (upload.status == UPLOAD_FILE_ABORTED)
   {
-    if (uploadFile) uploadFile.close();
-    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+    if (uploadFile)
+      uploadFile.close();
+    if (SD.exists(uploadFilePath))
+      SD.remove(uploadFilePath);
     uploadOK = false;
     uploadError = "upload_aborted";
+    endTransferLed();
   }
 }
 
@@ -790,7 +836,8 @@ void handleFileUploadAll()
 
   if (upload.status == UPLOAD_FILE_START)
   {
-    if (!uploadAllActive) resetUploadAllState();
+    if (!uploadAllActive)
+      resetUploadAllState();
 
     uploadOK = false;
     uploadError = "";
@@ -799,16 +846,19 @@ void handleFileUploadAll()
     uploadFilePath = "/uploads/" + uploadFileName;
 
     Serial.printf("[UPLOAD-ALL] START %s\n", uploadFileName.c_str());
+    setTransferLed(true);
 
     if (!ensureUploadDir())
     {
       uploadError = "cannot_create_uploads_dir";
       uploadAllFailed++;
       uploadAllErrors += uploadFileName + ": cannot_create_uploads_dir; ";
+      endTransferLed();
       return;
     }
 
-    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+    if (SD.exists(uploadFilePath))
+      SD.remove(uploadFilePath);
 
     uploadFile = SD.open(uploadFilePath, FILE_WRITE);
     if (!uploadFile)
@@ -816,6 +866,7 @@ void handleFileUploadAll()
       uploadError = "cannot_open_file_for_write";
       uploadAllFailed++;
       uploadAllErrors += uploadFileName + ": cannot_open_file_for_write; ";
+      endTransferLed();
       return;
     }
   }
@@ -825,7 +876,8 @@ void handleFileUploadAll()
     {
       size_t written = uploadFile.write(upload.buf, upload.currentSize);
       uploadBytes += written;
-      if (written != upload.currentSize) uploadError = "sd_write_failed";
+      if (written != upload.currentSize)
+        uploadError = "sd_write_failed";
     }
     else
     {
@@ -834,7 +886,11 @@ void handleFileUploadAll()
   }
   else if (upload.status == UPLOAD_FILE_END)
   {
-    if (uploadFile) { uploadFile.flush(); uploadFile.close(); }
+    if (uploadFile)
+    {
+      uploadFile.flush();
+      uploadFile.close();
+    }
 
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
@@ -843,27 +899,35 @@ void handleFileUploadAll()
       uploadAllBytes += uploadBytes;
       startUploadBlinkWhite();
       Serial.printf("[UPLOAD-ALL] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
+      endTransferLed();
     }
     else
     {
-      if (uploadError.length() == 0) uploadError = "empty_upload";
+      if (uploadError.length() == 0)
+        uploadError = "empty_upload";
       uploadAllFailed++;
       uploadAllErrors += uploadFileName + ": " + uploadError + "; ";
-      if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+      if (SD.exists(uploadFilePath))
+        SD.remove(uploadFilePath);
       Serial.printf("[UPLOAD-ALL] FAIL %s err=%s\n", uploadFileName.c_str(), uploadError.c_str());
+      endTransferLed();
     }
   }
   else if (upload.status == UPLOAD_FILE_ABORTED)
   {
-    if (uploadFile) uploadFile.close();
-    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+    if (uploadFile)
+      uploadFile.close();
+    if (SD.exists(uploadFilePath))
+      SD.remove(uploadFilePath);
     uploadOK = false;
     uploadError = "upload_aborted";
     uploadAllFailed++;
     uploadAllErrors += uploadFileName + ": upload_aborted; ";
+    endTransferLed();
   }
 }
 
+// ================== WIFI SWITCHING ==================
 void handleDeviceInfo()
 {
   String json = "{\"ok\":true,";
@@ -872,225 +936,703 @@ void handleDeviceInfo()
   server.send(200, "application/json", json);
 }
 
+void notifyTrustedHost()
+{
+  String ip = WiFi.localIP().toString();
+  String gw = WiFi.gatewayIP().toString();
+  String payload = "{\"ip\":\"" + ip + "\",\"type\":\"PhantomR3b\"}";
+  String url = "http://" + gw + ":" + String(SERVER_PORT) + "/api/device/connection";
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(payload);
+  Serial.printf("[NOTIFY] POST %s -> %d\n", url.c_str(), code);
+  http.end();
+}
+void startAP()
+{
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  delay(300);
+  ledAllOff();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+
+  currentMode = MODE_AP;
+  lastClientCount = 0;
+  Serial.printf("[WIFI] AP: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  server.begin();
+}
+
+bool connectToTrusted()
+{
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  delay(300);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("PhantomR3b");
+  WiFi.setSleep(false);
+  WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
+
+  Serial.printf("[WIFI] Dang ket noi %s...\n", TRUSTED_SSID);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    if (millis() - t > STA_CONNECT_TIMEOUT_MS)
+    {
+      Serial.println("[WIFI] Ket noi that bai, quay ve AP.");
+      startAP();
+      return false;
+    }
+    delay(200);
+  }
+
+  currentMode = MODE_STA;
+  Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
+  notifyTrustedHost();
+  server.begin();
+  return true;
+}
+
+void doWifiScan()
+{
+  Serial.println("[SCAN] Quet WiFi tim trusted AP...");
+  int n = WiFi.scanNetworks(false, true);
+  bool found = false;
+
+  for (int i = 0; i < n; i++)
+  {
+    if (WiFi.SSID(i) == TRUSTED_SSID)
+    {
+      found = true;
+      break;
+    }
+  }
+  WiFi.scanDelete();
+
+  if (found)
+  {
+    Serial.println("[SCAN] Tim thay trusted AP, chuyen sang STA.");
+    connectToTrusted();
+  }
+  else
+  {
+    Serial.println("[SCAN] Khong tim thay, giu AP.");
+  }
+}
+
+void checkSTAConnection()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("[WIFI] Mat ket noi STA, quay ve AP.");
+    startAP();
+  }
+}
+
 void handleNotFound()
 {
   String json = "{\"ok\":false,\"error\":\"not_found\",\"uri\":\"" + jsonEscape(server.uri()) + "\"}";
   server.send(404, "application/json", json);
 }
 
-// ================== SERIAL COM PROTOCOL ==================
-// Giao thuc text qua COM:
-//   LIST\n              -> JSON danh sach file trong /uploads
-//   STATUS\n            -> JSON thong tin SD + dinhDanh
-//   DELETE:ten_file\n   -> OK:ten_file\n hoac ERR:ly_do\n
-//   DELETE_ALL\n        -> OK:N\n hoac ERR:ly_do\n
-//   DOWNLOAD:ten_file\n -> SIZE:N\n + N bytes raw + DONE\n
-//   UPLOAD:ten_file:N\n -> (PC gui N bytes) -> OK:ten_file\n hoac ERR:ly_do\n
-//   PING\n              -> PONG\n
+// ================== SERIAL (USB CDC) COMMAND HANDLER ==================
+static String _serialBuf = "";
 
-String serialBuildFileList()
+static String base64Encode(const uint8_t *data, size_t len)
 {
-  File dir = SD.open("/uploads");
-  if (!dir || !dir.isDirectory())
-    return "{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}";
-
-  String json = "{\"ok\":true,\"dir\":\"/uploads\",\"files\":[";
-  bool first = true;
-
-  while (true)
+  const char *b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String out = "";
+  out.reserve(((len + 2) / 3) * 4 + 4);
+  for (size_t i = 0; i < len; i += 3)
   {
-    File file = dir.openNextFile();
-    if (!file) break;
-    if (!file.isDirectory())
+    uint32_t v = (uint32_t)data[i] << 16;
+    if (i + 1 < len)
+      v |= (uint32_t)data[i + 1] << 8;
+    if (i + 2 < len)
+      v |= data[i + 2];
+    out += b64[(v >> 18) & 0x3F];
+    out += b64[(v >> 12) & 0x3F];
+    out += (i + 1 < len) ? b64[(v >> 6) & 0x3F] : '=';
+    out += (i + 2 < len) ? b64[v & 0x3F] : '=';
+  }
+  return out;
+}
+
+static int _b64Val(char c)
+{
+  if (c >= 'A' && c <= 'Z')
+    return c - 'A';
+  if (c >= 'a' && c <= 'z')
+    return c - 'a' + 26;
+  if (c >= '0' && c <= '9')
+    return c - '0' + 52;
+  if (c == '+')
+    return 62;
+  if (c == '/')
+    return 63;
+  return -1;
+}
+
+static bool base64DecodeToBuffer(const String &b64, uint8_t *out, size_t outMax, size_t *outLen)
+{
+  *outLen = 0;
+  size_t len = b64.length();
+
+  if (len == 0 || (len % 4) != 0)
+    return false;
+
+  for (size_t i = 0; i + 3 < len; i += 4)
+  {
+    int v0 = _b64Val(b64[i]);
+    int v1 = _b64Val(b64[i + 1]);
+    int v2 = (b64[i + 2] != '=') ? _b64Val(b64[i + 2]) : -1;
+    int v3 = (b64[i + 3] != '=') ? _b64Val(b64[i + 3]) : -1;
+
+    if (v0 < 0 || v1 < 0)
+      return false;
+    if (b64[i + 2] != '=' && v2 < 0)
+      return false;
+    if (b64[i + 3] != '=' && v3 < 0)
+      return false;
+
+    if (*outLen + 1 > outMax)
+      return false;
+    out[(*outLen)++] = (uint8_t)((v0 << 2) | (v1 >> 4));
+
+    if (b64[i + 2] != '=')
     {
-      String fullName = String(file.name());
-      int slash = fullName.lastIndexOf('/');
-      String name = (slash >= 0) ? fullName.substring(slash + 1) : fullName;
-      uint64_t size = file.size();
-      if (!first) json += ",";
-      first = false;
-      json += "{\"name\":\"" + jsonEscape(name) + "\",";
-      json += "\"size\":" + String((unsigned long long)size) + ",";
-      json += "\"size_human\":\"" + humanSize(size) + "\"}";
+      if (*outLen + 1 > outMax)
+        return false;
+      out[(*outLen)++] = (uint8_t)((v1 << 4) | (v2 >> 2));
     }
-    file.close();
+
+    if (b64[i + 3] != '=')
+    {
+      if (*outLen + 1 > outMax)
+        return false;
+      out[(*outLen)++] = (uint8_t)((v2 << 6) | v3);
+    }
   }
-  dir.close();
-  json += "]}";
-  return json;
+
+  return true;
 }
 
-String serialBuildStatus()
+static String _jCmdStr(const String &j, const String &key) { return _jStr(j, key); }
+
+void processSerialCommand(const String &line)
 {
-  uint8_t cardType = SD.cardType();
-  String card = "UNKNOWN";
-  if (cardType == CARD_NONE)       card = "NONE";
-  else if (cardType == CARD_MMC)   card = "MMC";
-  else if (cardType == CARD_SD)    card = "SDSC";
-  else if (cardType == CARD_SDHC)  card = "SDHC/SDXC";
+  String cmd = _jCmdStr(line, "cmd");
 
-  String json = "{\"ok\":true,\"board\":\"ESP32-S3\",";
-  json += "\"mac\":\"" + WiFi.macAddress() + "\",";
-  json += "\"sd_card_type\":\"" + card + "\",";
-  json += "\"sd_spi_hz\":" + String((unsigned long)mountedSDFreq) + ",";
-  json += "\"sd_total\":" + String((unsigned long long)getTotalBytes()) + ",";
-  json += "\"sd_used\":" + String((unsigned long long)getUsedBytes()) + ",";
-  json += "\"sd_total_human\":\"" + humanSize(getTotalBytes()) + "\",";
-  json += "\"sd_used_human\":\"" + humanSize(getUsedBytes()) + "\",";
-  json += "\"dinh_danh\":{";
-  json += "\"ma_id\":\"" + jsonEscape(dinhDanh.ma_id) + "\",";
-  json += "\"ho_ten\":\"" + jsonEscape(dinhDanh.ho_ten) + "\",";
-  json += "\"nam_sinh\":" + String(dinhDanh.nam_sinh) + ",";
-  json += "\"dia_chi\":\"" + jsonEscape(dinhDanh.dia_chi) + "\",";
-  json += "\"ten_thiet_bi\":\"" + jsonEscape(dinhDanh.ten_thiet_bi) + "\",";
-  json += "\"id_thiet_bi\":\"" + jsonEscape(dinhDanh.id_thiet_bi) + "\"";
-  json += "}}";
-  return json;
-}
-
-void handleSerialCommands()
-{
-  if (!Serial.available()) return;
-
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-  if (cmd.length() == 0) return;
-
-  // PING
-  if (cmd == "PING") {
-    Serial.println("PONG");
+  // ── ping / identify ──────────────────────────────────────────────
+  if (cmd == "ping")
+  {
+    Serial.println("{\"ok\":true,\"type\":\"PHANTOMR3B\",\"board\":\"ESP32-S3\",\"version\":\"1.0\"}");
     return;
   }
 
-  // LIST
-  if (cmd == "LIST") {
-    Serial.println(serialBuildFileList());
+  // ── status ───────────────────────────────────────────────────────
+  if (cmd == "status")
+  {
+    uint8_t ct = SD.cardType();
+    String card = ct == CARD_MMC ? "MMC" : ct == CARD_SD ? "SDSC"
+                                       : ct == CARD_SDHC ? "SDHC/SDXC"
+                                                         : "UNKNOWN";
+    String ip = (currentMode == MODE_STA) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    String r = "{\"ok\":true,\"board\":\"ESP32-S3\",\"type\":\"PHANTOMR3B\",";
+    r += "\"wifi_mode\":\"" + String(currentMode == MODE_STA ? "STA" : "AP") + "\",";
+    r += "\"ip\":\"" + ip + "\",";
+    r += "\"sd_card_type\":\"" + card + "\",";
+    r += "\"sd_total\":" + String((unsigned long long)getTotalBytes()) + ",";
+    r += "\"sd_used\":" + String((unsigned long long)getUsedBytes()) + ",";
+    r += "\"sd_total_human\":\"" + humanSize(getTotalBytes()) + "\",";
+    r += "\"sd_used_human\":\"" + humanSize(getUsedBytes()) + "\"}";
+    Serial.println(r);
     return;
   }
 
-  // STATUS
-  if (cmd == "STATUS") {
-    Serial.println(serialBuildStatus());
+  // ── dinh_danh GET ────────────────────────────────────────────────
+  if (cmd == "dinh_danh")
+  {
+    String r = "{\"ok\":true,";
+    r += "\"ma_id\":\"" + jsonEscape(dinhDanh.ma_id) + "\",";
+    r += "\"ho_ten\":\"" + jsonEscape(dinhDanh.ho_ten) + "\",";
+    r += "\"nam_sinh\":" + String(dinhDanh.nam_sinh) + ",";
+    r += "\"dia_chi\":\"" + jsonEscape(dinhDanh.dia_chi) + "\",";
+    r += "\"ngay_cap_dinh_danh\":\"" + jsonEscape(dinhDanh.ngay_cap_dinh_danh) + "\",";
+    r += "\"ten_thiet_bi\":\"" + jsonEscape(dinhDanh.ten_thiet_bi) + "\",";
+    r += "\"id_thiet_bi\":\"" + jsonEscape(dinhDanh.id_thiet_bi) + "\",";
+    r += "\"dia_chi_thiet_bi\":\"" + jsonEscape(dinhDanh.dia_chi_thiet_bi) + "\"}";
+    Serial.println(r);
     return;
   }
 
-  // DELETE_ALL
-  if (cmd == "DELETE_ALL") {
+  // ── dinh_danh SET ────────────────────────────────────────────────
+  if (cmd == "set_dinh_danh")
+  {
+    String v;
+    int n;
+    if ((v = _jStr(line, "ma_id")).length())
+      dinhDanh.ma_id = v;
+    if ((v = _jStr(line, "ho_ten")).length())
+      dinhDanh.ho_ten = v;
+    if ((n = _jInt(line, "nam_sinh")) >= 0)
+      dinhDanh.nam_sinh = n;
+    if ((v = _jStr(line, "dia_chi")).length())
+      dinhDanh.dia_chi = v;
+    if ((v = _jStr(line, "ngay_cap_dinh_danh")).length())
+      dinhDanh.ngay_cap_dinh_danh = v;
+    if ((v = _jStr(line, "ten_thiet_bi")).length())
+      dinhDanh.ten_thiet_bi = v;
+    if ((v = _jStr(line, "id_thiet_bi")).length())
+      dinhDanh.id_thiet_bi = v;
+    if ((v = _jStr(line, "dia_chi_thiet_bi")).length())
+      dinhDanh.dia_chi_thiet_bi = v;
+    if (saveDinhDanhToSD())
+      Serial.println("{\"ok\":true}");
+    else
+      Serial.println("{\"ok\":false,\"error\":\"sd_write_failed\"}");
+    return;
+  }
+
+  // ── filelist ─────────────────────────────────────────────────────
+  if (cmd == "filelist")
+  {
     File dir = SD.open("/uploads");
-    if (!dir || !dir.isDirectory()) { Serial.println("ERR:cannot_open_uploads_dir"); return; }
-    uint32_t del = 0;
-    while (true) {
+    if (!dir || !dir.isDirectory())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}");
+      return;
+    }
+    String r = "{\"ok\":true,\"files\":[";
+    bool first = true;
+    while (true)
+    {
       File f = dir.openNextFile();
-      if (!f) break;
-      if (!f.isDirectory()) {
+      if (!f)
+        break;
+      if (!f.isDirectory())
+      {
         String fn = String(f.name());
         int sl = fn.lastIndexOf('/');
-        String nm = (sl >= 0) ? fn.substring(sl + 1) : fn;
-        f.close();
-        if (SD.remove("/uploads/" + nm)) del++;
-      } else { f.close(); }
+        if (sl >= 0)
+          fn = fn.substring(sl + 1);
+        uint64_t sz = f.size();
+        if (!first)
+          r += ",";
+        first = false;
+        r += "{\"name\":\"" + jsonEscape(fn) + "\",\"size\":" + String((unsigned long long)sz) + ",\"size_human\":\"" + humanSize(sz) + "\"}";
+      }
+      f.close();
     }
     dir.close();
-    Serial.println("OK:" + String(del));
+    r += "]}";
+    Serial.println(r);
     return;
   }
 
-  // DELETE:filename
-  if (cmd.startsWith("DELETE:")) {
-    String name = safeFileName(cmd.substring(7));
-    if (name.length() == 0) { Serial.println("ERR:missing_name"); return; }
+  // ── download ─────────────────────────────────────────────────────
+  // Legacy: chỉ dùng cho file nhỏ (< SERIAL_DECODE_BUF_SIZE bytes).
+  // File lớn phải dùng download_begin / download_chunk.
+  if (cmd == "download")
+  {
+    String name = safeFileName(_jStr(line, "name"));
+    if (!name.length())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"missing_name\"}");
+      return;
+    }
     String path = "/uploads/" + name;
-    if (!SD.exists(path)) { Serial.println("ERR:file_not_found"); return; }
-    if (SD.remove(path)) Serial.println("OK:" + name);
-    else                 Serial.println("ERR:delete_failed");
-    return;
-  }
-
-  // DOWNLOAD:filename
-  if (cmd.startsWith("DOWNLOAD:")) {
-    String name = safeFileName(cmd.substring(9));
-    if (name.length() == 0) { Serial.println("ERR:missing_name"); return; }
-    String path = "/uploads/" + name;
-    if (!SD.exists(path)) { Serial.println("ERR:file_not_found"); return; }
+    if (!SD.exists(path))
+    {
+      Serial.println("{\"ok\":false,\"error\":\"file_not_found\"}");
+      return;
+    }
     File f = SD.open(path, FILE_READ);
-    if (!f) { Serial.println("ERR:cannot_open_file"); return; }
-    uint64_t sz = f.size();
-    Serial.println("SIZE:" + String((unsigned long long)sz));
-    uint8_t buf[SERIAL_UPLOAD_CHUNK];
-    while (f.available()) {
-      int n = f.read(buf, SERIAL_UPLOAD_CHUNK);
-      if (n > 0) Serial.write(buf, n);
+    if (!f)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"cannot_open_file\"}");
+      return;
     }
+    size_t sz = f.size();
+    if (sz > SERIAL_DECODE_BUF_SIZE)
+    {
+      f.close();
+      // Redirect client to use chunked protocol
+      Serial.println("{\"ok\":false,\"error\":\"file_too_large_use_download_chunk\",\"size\":" + String((unsigned long)sz) + "}");
+      return;
+    }
+    setTransferLed(true);
+    f.read(_serialDecodeBuf, sz);
     f.close();
-    Serial.println("DONE");
+    String b64 = base64Encode(_serialDecodeBuf, sz);
+    String r = "{\"ok\":true,\"name\":\"" + jsonEscape(name) + "\",\"size\":" + String((unsigned long)sz) + ",\"data_b64\":\"" + b64 + "\"}";
+    Serial.println(r);
+    SD.remove(path);
+    endTransferLed();
     return;
   }
 
-  // UPLOAD:filename:size
-  if (cmd.startsWith("UPLOAD:")) {
-    String rest = cmd.substring(7);
-    int colon = rest.lastIndexOf(':');
-    if (colon < 1) { Serial.println("ERR:bad_command"); return; }
-    String name = safeFileName(rest.substring(0, colon));
-    uint32_t size = rest.substring(colon + 1).toInt();
-    if (name.length() == 0 || size == 0) { Serial.println("ERR:bad_command"); return; }
-
-    if (!ensureUploadDir()) { Serial.println("ERR:cannot_create_uploads_dir"); return; }
-    String path = "/uploads/" + name;
-    if (SD.exists(path)) SD.remove(path);
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) { Serial.println("ERR:cannot_open_file_for_write"); return; }
-
-    Serial.println("READY");
-
-    uint32_t received = 0;
-    uint8_t buf[SERIAL_UPLOAD_CHUNK];
-    unsigned long lastRecv = millis();
-
-    while (received < size) {
-      if (millis() - lastRecv > SERIAL_CMD_TIMEOUT_MS) {
-        f.close();
-        SD.remove(path);
-        Serial.println("ERR:timeout");
-        return;
-      }
-      int avail = Serial.available();
-      if (avail <= 0) continue;
-      uint32_t need = size - received;
-      int toRead = (avail < (int)SERIAL_UPLOAD_CHUNK) ? avail : SERIAL_UPLOAD_CHUNK;
-      if ((uint32_t)toRead > need) toRead = (int)need;
-      int n = Serial.readBytes(buf, toRead);
-      if (n > 0) {
-        f.write(buf, n);
-        received += n;
-        lastRecv = millis();
-      }
+  // ── download_begin ────────────────────────────────────────────────
+  if (cmd == "download_begin")
+  {
+    String name = safeFileName(_jStr(line, "name"));
+    if (!name.length())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"missing_name\"}");
+      return;
     }
+    String path = "/uploads/" + name;
+    if (!SD.exists(path))
+    {
+      Serial.println("{\"ok\":false,\"error\":\"file_not_found\"}");
+      return;
+    }
+    if (_serialDownFile)
+      _serialDownFile.close();
+    _serialDownFile = SD.open(path, FILE_READ);
+    if (!_serialDownFile)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"cannot_open_file\"}");
+      return;
+    }
+    _serialDownName = name;
+    _serialDownSize = _serialDownFile.size();
+    _serialDownRead = 0;
+    _serialDownChunks = (_serialDownSize + SERIAL_DOWN_CHUNK - 1) / SERIAL_DOWN_CHUNK;
+    setTransferLed(true);
+    Serial.println("{\"ok\":true,\"name\":\"" + jsonEscape(name) + "\",\"size\":" + String((unsigned long)_serialDownSize) + ",\"chunks\":" + String(_serialDownChunks) + "}");
+    return;
+  }
+
+  // ── download_chunk ────────────────────────────────────────────────
+  if (cmd == "download_chunk")
+  {
+    if (!_serialDownFile)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"no_download_in_progress\"}");
+      return;
+    }
+    size_t toRead = min((size_t)SERIAL_DOWN_CHUNK, _serialDownSize - _serialDownRead);
+    size_t got = _serialDownFile.read(_serialDecodeBuf, toRead);
+    _serialDownRead += got;
+    bool done = (_serialDownRead >= _serialDownSize);
+    String b64 = base64Encode(_serialDecodeBuf, got);
+    String r = "{\"ok\":true,\"data_b64\":\"" + b64 + "\",\"done\":" + String(done ? "true" : "false") + "}";
+    Serial.println(r);
+    if (done)
+    {
+      _serialDownFile.close();
+      SD.remove("/uploads/" + _serialDownName);
+      _serialDownName = "";
+      _serialDownSize = 0;
+      _serialDownRead = 0;
+      endTransferLed();
+    }
+    return;
+  }
+
+  // ── delete ───────────────────────────────────────────────────────
+  if (cmd == "delete")
+  {
+    String name = safeFileName(_jStr(line, "name"));
+    if (!name.length())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"missing_name\"}");
+      return;
+    }
+    String path = "/uploads/" + name;
+    if (!SD.exists(path))
+    {
+      Serial.println("{\"ok\":false,\"error\":\"file_not_found\"}");
+      return;
+    }
+    Serial.println(SD.remove(path) ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"delete_failed\"}");
+    return;
+  }
+
+  // ── upload_bin ───────────────────────────────────────────────────
+  // Chỉ dùng cho file rất nhỏ. File lớn phải dùng upload_begin/upload_chunk/upload_end.
+  if (cmd == "upload_bin")
+  {
+    String name = safeFileName(_jStr(line, "name"));
+    if (!name.length())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"missing_name\"}");
+      return;
+    }
+
+    String b64 = _jStr(line, "data_b64");
+    if (!b64.length())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"missing_data_b64\"}");
+      return;
+    }
+
+    if (b64.length() > SERIAL_B64_MAX_LEN)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"file_too_large_use_upload_chunk\"}");
+      return;
+    }
+
+    size_t sz = 0;
+    if (!base64DecodeToBuffer(b64, _serialDecodeBuf, SERIAL_DECODE_BUF_SIZE, &sz))
+    {
+      Serial.println("{\"ok\":false,\"error\":\"base64_decode_failed_or_chunk_too_large\"}");
+      return;
+    }
+
+    setTransferLed(true);
+
+    if (!ensureUploadDir())
+    {
+      endTransferLed();
+      Serial.println("{\"ok\":false,\"error\":\"cannot_create_uploads_dir\"}");
+      return;
+    }
+
+    String path = "/uploads/" + name;
+    if (SD.exists(path))
+      SD.remove(path);
+
+    File f = SD.open(path, FILE_WRITE);
+    if (!f)
+    {
+      endTransferLed();
+      Serial.println("{\"ok\":false,\"error\":\"cannot_open_file\"}");
+      return;
+    }
+
+    size_t written = f.write(_serialDecodeBuf, sz);
     f.flush();
     f.close();
-    startUploadBlinkWhite();
-    Serial.println("OK:" + name);
-    Serial.printf("[SERIAL] Upload OK: %s %lu bytes\n", name.c_str(), (unsigned long)received);
+
+    if (written != sz)
+    {
+      if (SD.exists(path))
+        SD.remove(path);
+      Serial.println("{\"ok\":false,\"error\":\"sd_write_failed\"}");
+      endTransferLed();
+      return;
+    }
+
+    String r = "{\"ok\":true,\"name\":\"" + jsonEscape(name) + "\",\"size\":" + String((unsigned long long)sz) + "}";
+    Serial.println(r);
+    endTransferLed();
     return;
   }
 
-  Serial.println("ERR:unknown_command");
+  // ── upload_begin ─────────────────────────────────────────────────────────
+  if (cmd == "upload_begin")
+  {
+    String name = safeFileName(_jStr(line, "name"));
+    if (!name.length())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"missing_name\"}");
+      return;
+    }
+    if (!ensureUploadDir())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"cannot_create_uploads_dir\"}");
+      return;
+    }
+
+    String path = "/uploads/" + name;
+    if (SD.exists(path))
+      SD.remove(path);
+    if (_serialUpFile)
+      _serialUpFile.close();
+
+    _serialUpFile = SD.open(path, FILE_WRITE);
+    if (!_serialUpFile)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"cannot_open_file\"}");
+      return;
+    }
+
+    _serialUpName = name;
+    _serialUpWritten = 0;
+    _serialUpTotal = (size_t)_jInt(line, "total");
+    setTransferLed(true);
+
+    Serial.println("{\"ok\":true,\"mode\":\"direct_to_sd\",\"max_b64_len\":" + String(SERIAL_B64_MAX_LEN) + "}");
+    return;
+  }
+
+  // ── upload_chunk ─────────────────────────────────────────────────────────
+  // Nhận 1 chunk base64 -> decode vào buffer cố định -> ghi ngay xuống SD.
+  if (cmd == "upload_chunk")
+  {
+    if (!_serialUpFile)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"no_upload_in_progress\"}");
+      return;
+    }
+
+    String b64 = _jStr(line, "data_b64");
+    if (!b64.length())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"missing_data_b64\"}");
+      return;
+    }
+
+    if (b64.length() > SERIAL_B64_MAX_LEN)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"chunk_too_large\",\"max_b64_len\":" + String(SERIAL_B64_MAX_LEN) + "}");
+      return;
+    }
+
+    size_t sz = 0;
+    if (!base64DecodeToBuffer(b64, _serialDecodeBuf, SERIAL_DECODE_BUF_SIZE, &sz))
+    {
+      Serial.println("{\"ok\":false,\"error\":\"base64_decode_failed_or_chunk_too_large\"}");
+      return;
+    }
+
+    size_t written = _serialUpFile.write(_serialDecodeBuf, sz);
+    if (written != sz)
+    {
+      _serialUpFile.flush();
+      _serialUpFile.close();
+      SD.remove("/uploads/" + _serialUpName);
+      _serialUpName = "";
+      _serialUpWritten = 0;
+      Serial.println("{\"ok\":false,\"error\":\"sd_write_failed\"}");
+      endTransferLed();
+      return;
+    }
+
+    _serialUpWritten += written;
+
+    // Flush định kỳ để dữ liệu thật sự xuống thẻ, tránh mất file nếu rút nguồn giữa chừng.
+    if ((_serialUpWritten % (64 * 1024)) < written)
+    {
+      _serialUpFile.flush();
+    }
+
+    startUploadBlinkWhite();
+    Serial.println("{\"ok\":true,\"written\":" + String((unsigned long)_serialUpWritten) + "}");
+    return;
+  }
+
+  // ── upload_end ───────────────────────────────────────────────────────────
+  if (cmd == "upload_end")
+  {
+    if (!_serialUpFile)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"no_upload_in_progress\"}");
+      return;
+    }
+
+    _serialUpFile.flush();
+    _serialUpFile.close();
+
+    if (_serialUpTotal > 0 && _serialUpWritten != _serialUpTotal)
+    {
+      SD.remove("/uploads/" + _serialUpName);
+      String r = "{\"ok\":false,\"error\":\"size_mismatch\",\"expected\":" + String((unsigned long)_serialUpTotal) + ",\"written\":" + String((unsigned long)_serialUpWritten) + "}";
+      _serialUpName = "";
+      _serialUpWritten = 0;
+      _serialUpTotal = 0;
+      Serial.println(r);
+      endTransferLed();
+      return;
+    }
+
+    String r = "{\"ok\":true,\"name\":\"" + jsonEscape(_serialUpName) + "\",\"size\":" + String((unsigned long)_serialUpWritten) + ",\"saved_to\":\"/uploads/" + jsonEscape(_serialUpName) + "\"}";
+    _serialUpName = "";
+    _serialUpWritten = 0;
+    _serialUpTotal = 0;
+    Serial.println(r);
+    endTransferLed();
+    return;
+  }
+
+  // ── delete_all ───────────────────────────────────────────────────
+  if (cmd == "delete_all")
+  {
+    File dir = SD.open("/uploads");
+    if (!dir || !dir.isDirectory())
+    {
+      Serial.println("{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}");
+      return;
+    }
+    uint32_t ok_count = 0, fail_count = 0;
+    while (true)
+    {
+      File f = dir.openNextFile();
+      if (!f)
+        break;
+      if (!f.isDirectory())
+      {
+        String fn = String(f.name());
+        int sl = fn.lastIndexOf('/');
+        if (sl >= 0)
+          fn = fn.substring(sl + 1);
+        f.close();
+        SD.remove("/uploads/" + fn) ? ok_count++ : fail_count++;
+      }
+      else
+        f.close();
+    }
+    dir.close();
+    Serial.println("{\"ok\":" + String(fail_count == 0 ? "true" : "false") + ",\"deleted\":" + String(ok_count) + ",\"failed\":" + String(fail_count) + "}");
+    return;
+  }
+
+  Serial.println("{\"ok\":false,\"error\":\"unknown_cmd\"}");
+}
+
+void handleSerial()
+{
+  while (Serial.available())
+  {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r')
+    {
+      _serialBuf.trim();
+      if (_serialBuf.startsWith("{"))
+        processSerialCommand(_serialBuf);
+      _serialBuf = "";
+    }
+    else
+    {
+      if (_serialBuf.length() > (SERIAL_B64_MAX_LEN + 512))
+      {
+        _serialBuf = "";
+        Serial.println("{\"ok\":false,\"error\":\"serial_line_too_large_use_smaller_chunk\"}");
+      }
+      else
+      {
+        _serialBuf += c;
+      }
+    }
+  }
 }
 
 // ================== SETUP ==================
 void setup()
 {
-  Serial.begin(SERIAL_BAUD);
+  Serial.setRxBufferSize(32768);
+  Serial.setTxBufferSize(32768);
+  Serial.begin(115200);
   delay(1500);
 
   Serial.println();
-  Serial.println("=== ESP32-S3 microSD SERVER (AP+COM) ===");
+  Serial.println("=== ESP32-S3 microSD WIFI SERVER ===");
 
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_WHITE, OUTPUT);
-  ledAllOff();
-  ledRed(true);
+  setLedState(LED_STATE_IDLE);
 
   Serial.println("[SD] Khoi tao SPI...");
   spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -1099,40 +1641,109 @@ void setup()
   if (!initSDWithFallback())
   {
     Serial.println("[SD] FAIL: Khong nhan duoc the nho!");
-    while (true) { ledRed(true); delay(300); ledRed(false); delay(300); }
+    while (true)
+    {
+      setLedState(LED_STATE_ERROR);
+      delay(300);
+      ledAllOff();
+      delay(300);
+    }
   }
 
   if (!ensureUploadDir())
   {
     Serial.println("[SD] FAIL: Khong tao duoc /uploads");
-    while (true) { ledRed(true); delay(100); ledRed(false); delay(100); }
+    while (true)
+    {
+      setLedState(LED_STATE_ERROR);
+      delay(100);
+      ledAllOff();
+      delay(100);
+    }
   }
 
   loadDinhDanhFromSD();
 
   uint8_t cardType = SD.cardType();
   Serial.print("[SD] Loai the: ");
-  if (cardType == CARD_MMC)        Serial.println("MMC");
-  else if (cardType == CARD_SD)    Serial.println("SDSC");
-  else if (cardType == CARD_SDHC)  Serial.println("SDHC/SDXC");
-  else                             Serial.println("UNKNOWN");
+  if (cardType == CARD_MMC)
+    Serial.println("MMC");
+  else if (cardType == CARD_SD)
+    Serial.println("SDSC");
+  else if (cardType == CARD_SDHC)
+    Serial.println("SDHC/SDXC");
+  else
+    Serial.println("UNKNOWN");
 
   Serial.printf("[SD] Total: %s  Used: %s\n",
-    humanSize(SD.totalBytes()).c_str(), humanSize(SD.usedBytes()).c_str());
+                humanSize(SD.totalBytes()).c_str(), humanSize(SD.usedBytes()).c_str());
 
-  Serial.println("[WIFI] Khoi dong AP...");
-  WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.softAPConfig(local_IP, gateway, subnet);
-  if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN))
+  Serial.println("[WIFI] Quet WiFi tim trusted AP...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("PhantomR3b");
+  int n = WiFi.scanNetworks(false, true);
+  bool trustedFound = false;
+  for (int i = 0; i < n; i++)
   {
-    Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
-    while (true) { ledRed(true); delay(500); ledRed(false); delay(500); }
+    if (WiFi.SSID(i) == TRUSTED_SSID)
+    {
+      trustedFound = true;
+      break;
+    }
   }
-  ledRed(false);
-  Serial.printf("[WIFI] AP SSID: %s  IP: %s  PORT: %d\n",
-    AP_SSID, WiFi.softAPIP().toString().c_str(), SERVER_PORT);
+  WiFi.scanDelete();
+
+  if (trustedFound)
+  {
+    Serial.println("[WIFI] Tim thay trusted AP, ket noi STA...");
+    WiFi.setSleep(false);
+    WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
+    unsigned long t = millis();
+    bool connected = false;
+    while (millis() - t < STA_CONNECT_TIMEOUT_MS)
+    {
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        connected = true;
+        break;
+      }
+      delay(200);
+    }
+    if (connected)
+    {
+      currentMode = MODE_STA;
+      updateConnectionLed();
+      Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
+      notifyTrustedHost();
+    }
+    else
+    {
+      Serial.println("[WIFI] Ket noi STA that bai, chuyen sang AP.");
+    }
+  }
+
+  if (currentMode != MODE_STA)
+  {
+    Serial.println("[WIFI] Cau hinh IP AP...");
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    WiFi.softAPConfig(local_IP, gateway, subnet);
+    if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN))
+    {
+      Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
+      while (true)
+      {
+        setLedState(LED_STATE_ERROR);
+        delay(500);
+        ledAllOff();
+        delay(500);
+      }
+    }
+    updateConnectionLed();
+    Serial.printf("[WIFI] SSID: %s  IP: %s  PORT: %d\n",
+                  AP_SSID, WiFi.softAPIP().toString().c_str(), SERVER_PORT);
+  }
 
   setWifiLedByClient();
 
@@ -1141,17 +1752,17 @@ void setup()
   server.on("/api/filelist", HTTP_GET, handleFileList);
   server.on("/api/download", HTTP_GET, handleDownload);
 
-  server.on("/api/delete", HTTP_GET,    handleDelete);
-  server.on("/api/delete", HTTP_POST,   handleDelete);
+  server.on("/api/delete", HTTP_GET, handleDelete);
+  server.on("/api/delete", HTTP_POST, handleDelete);
   server.on("/api/delete", HTTP_DELETE, handleDelete);
 
-  server.on("/api/delete-all", HTTP_POST,   handleDeleteAll);
+  server.on("/api/delete-all", HTTP_POST, handleDeleteAll);
   server.on("/api/delete-all", HTTP_DELETE, handleDeleteAll);
 
-  server.on("/api/upload",     HTTP_POST, handleUploadResponse, handleFileUpload);
+  server.on("/api/upload", HTTP_POST, handleUploadResponse, handleFileUpload);
   server.on("/api/upload-all", HTTP_POST, handleUploadAllResponse, handleFileUploadAll);
 
-  server.on("/api/dinh-danh", HTTP_GET,  handleGetDinhDanh);
+  server.on("/api/dinh-danh", HTTP_GET, handleGetDinhDanh);
   server.on("/api/dinh-danh", HTTP_POST, handlePostDinhDanh);
 
   server.on("/api/device-info", HTTP_GET, handleDeviceInfo);
@@ -1159,9 +1770,9 @@ void setup()
   server.onNotFound(handleNotFound);
 
   server.begin();
+  lastScanMs = millis();
 
-  Serial.println("[HTTP] WiFi AP server started");
-  Serial.println("[COM]  Serial COM ready - giao thuc: LIST/STATUS/PING/DELETE/DOWNLOAD/UPLOAD");
+  Serial.println("[HTTP] Server started");
   Serial.println("=== READY ===");
 }
 
@@ -1170,5 +1781,17 @@ void loop()
 {
   server.handleClient();
   updateStatusLed();
-  handleSerialCommands();
+  handleSerial();
+
+  unsigned long now = millis();
+
+  if (currentMode == MODE_STA)
+  {
+    checkSTAConnection();
+  }
+  else if (now - lastScanMs >= SCAN_INTERVAL_MS)
+  {
+    lastScanMs = now;
+    doWifiScan();
+  }
 }
