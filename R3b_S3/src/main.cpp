@@ -44,14 +44,14 @@ WebServer server(SERVER_PORT);
 #define AP_MAX_CONN 2
 
 // ================== LED STATE ==================
-// Quy ước LED: mỗi thời điểm chỉ có 1 trạng thái màu rõ ràng.
-// VÀNG     = bật nguồn / đang phát WiFi AP / chưa có ai kết nối
-// XANH     = có ít nhất 1 kết nối WiFi client / USB CDC / STA đã bắt được WiFi 001
-// ĐỎ       = đang upload hoặc download file
-// ĐỎ NHÁY  = lỗi SD / lỗi WiFi AP
+// Quy ước LED: mỗi thời điểm chỉ có đúng 1 trạng thái LED.
+// IDLE      = Tắt hết: không có kết nối
+// CONNECTED = Xanh: có WiFi client / USB CDC / STA connected
+// TRANSFER  = Đỏ: đang upload / download file
+// ERROR     = Đỏ nháy: lỗi SD / lỗi WiFi AP
 enum LedState
 {
-  LED_STATE_IDLE,      // Vàng
+  LED_STATE_IDLE,      // Tắt hết
   LED_STATE_CONNECTED, // Xanh
   LED_STATE_TRANSFER,  // Đỏ liên tục
   LED_STATE_ERROR      // Đỏ nháy, dùng trong vòng lặp lỗi
@@ -77,6 +77,7 @@ String uploadFilePath = "";
 bool uploadOK = false;
 String uploadError = "";
 uint64_t uploadBytes = 0;
+uint32_t uploadStartMs = 0;
 
 // ── serial chunked upload state ──────────────────────────────────────────────
 File _serialUpFile;
@@ -97,6 +98,7 @@ String _serialDownName = "";
 size_t _serialDownSize = 0;
 size_t _serialDownRead = 0;
 uint32_t _serialDownChunks = 0;
+uint32_t _serialDownStartMs = 0;
 #define SERIAL_DOWN_CHUNK 12288 // bytes per chunk → base64 ~16384 chars
 
 // ================== UPLOAD ALL STATE ==================
@@ -134,6 +136,21 @@ String jsonEscape(const String &s)
       out += c;
   }
   return out;
+}
+
+// ================== TRANSFER LOG ==================
+void logTransfer(const char *type, const String &name, uint64_t bytes, float sec, float kbs, const char *status)
+{
+  bool writeHeader = !SD.exists("/transfer_log.csv");
+  File f = SD.open("/transfer_log.csv", FILE_APPEND);
+  if (!f)
+    return;
+  if (writeHeader)
+    f.println("uptime_ms,type,filename,bytes,duration_s,speed_kbs,status");
+  f.printf("%lu,%s,%s,%llu,%.2f,%.1f,%s\n",
+           (unsigned long)millis(), type, name.c_str(),
+           (unsigned long long)bytes, sec, kbs, status);
+  f.close();
 }
 
 // ================== DINH DANH ==================
@@ -307,43 +324,49 @@ uint64_t getUsedBytes() { return SD.usedBytes(); }
 uint64_t getTotalBytes() { return SD.totalBytes(); }
 
 // ================== LED FUNCTIONS ==================
+// Theo hiện tượng bạn báo: để im mà sáng cả 3 đèn => mạch LED đang là HIGH = sáng, LOW = tắt.
+// Nếu mạch của bạn là loại ngược lại thì chỉ cần đổi LED_ON/LED_OFF.
+#define LED_ON HIGH
+#define LED_OFF LOW
+
 void ledAllOff()
 {
-  digitalWrite(LED_RED, LOW);
-  digitalWrite(LED_GREEN, LOW);
-  digitalWrite(LED_WHITE, LOW);
+  digitalWrite(LED_RED, LED_OFF);
+  digitalWrite(LED_GREEN, LED_OFF);
+  digitalWrite(LED_WHITE, LED_OFF);
 }
 
-void ledRed(bool on) { digitalWrite(LED_RED, on ? HIGH : LOW); }
-void ledGreen(bool on) { digitalWrite(LED_GREEN, on ? HIGH : LOW); }
-void ledWhite(bool on) { digitalWrite(LED_WHITE, on ? HIGH : LOW); }
+void ledRed(bool on) { digitalWrite(LED_RED, on ? LED_ON : LED_OFF); }
+void ledGreen(bool on) { digitalWrite(LED_GREEN, on ? LED_ON : LED_OFF); }
+void ledWhite(bool on) { digitalWrite(LED_WHITE, on ? LED_ON : LED_OFF); }
 
 void setLedState(LedState st)
 {
   g_ledState = st;
 
-  // Tắt hết trước để đảm bảo không bị lẫn màu.
+  // Luôn tắt hết trước để đảm bảo mỗi thời điểm chỉ đúng 1 đèn sáng.
   ledAllOff();
 
   switch (st)
   {
   case LED_STATE_IDLE:
-    // Vàng = đỏ + xanh trên LED RGB.
-    digitalWrite(LED_RED, HIGH);
-    digitalWrite(LED_GREEN, HIGH);
+    // IDLE = không có kết nối => tắt hết
     break;
 
   case LED_STATE_CONNECTED:
-    digitalWrite(LED_GREEN, HIGH);
+    // CONNECTED = xanh
+    ledGreen(true);
     break;
 
   case LED_STATE_TRANSFER:
-    digitalWrite(LED_RED, HIGH);
+    // TRANSFER = đỏ liên tục
+    ledRed(true);
     break;
 
   case LED_STATE_ERROR:
   default:
-    digitalWrite(LED_RED, HIGH);
+    // ERROR = đỏ, nháy xử lý bằng vòng lặp delay bên ngoài
+    ledRed(true);
     break;
   }
 }
@@ -370,10 +393,6 @@ uint8_t getActiveConnectionCount()
 {
   uint8_t count = 0;
 
-  // USB CDC từ app/bridge trên máy tính.
-  if (isUsbSerialConnected())
-    count++;
-
   // WiFi AP: số client đang nối vào ESP32.
   if (currentMode == MODE_AP)
   {
@@ -391,14 +410,25 @@ uint8_t getActiveConnectionCount()
 
 void updateConnectionLed()
 {
+  // Ưu tiên trạng thái: ERROR > TRANSFER > CONNECTED > IDLE
+  if (g_ledState == LED_STATE_ERROR)
+    return;
+
   if (transferLedActive)
     return;
 
   uint8_t totalConnections = getActiveConnectionCount();
+
+  // USB CDC cũng được tính là một kết nối nếu host đang mở cổng Serial.
+  if (isUsbSerialConnected())
+  {
+    totalConnections++;
+  }
+
   lastClientCount = (currentMode == MODE_AP) ? WiFi.softAPgetStationNum() : 0;
 
   if (totalConnections == 0)
-    setLedState(LED_STATE_IDLE); // Vàng: chưa có kết nối
+    setLedState(LED_STATE_IDLE); // Tắt hết: chưa có kết nối
   else
     setLedState(LED_STATE_CONNECTED); // Xanh: có ít nhất 1 kết nối
 }
@@ -611,11 +641,20 @@ void handleDownload()
     return;
   }
 
+  uint64_t fileSize = file.size();
   setTransferLed(true);
+  uint32_t dlStart = millis();
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
   server.streamFile(file, "application/octet-stream");
+  uint32_t dlMs = millis() - dlStart;
   file.close();
   endTransferLed();
+
+  float dlSec = dlMs / 1000.0f;
+  float dlKBs = (dlSec > 0) ? (fileSize / 1024.0f / dlSec) : 0;
+  Serial.printf("[DOWNLOAD] %s | %llu bytes | %.2f s | %.1f KB/s\n",
+                name.c_str(), (unsigned long long)fileSize, dlSec, dlKBs);
+  logTransfer("HTTP_DOWN", name, fileSize, dlSec, dlKBs, "ok");
 
   SD.remove(path);
   Serial.printf("[DOWNLOAD] Xoa file sau download: %s\n", name.c_str());
@@ -711,6 +750,7 @@ void handleFileUpload()
     uploadOK = false;
     uploadError = "";
     uploadBytes = 0;
+    uploadStartMs = millis();
     uploadFileName = safeFileName(upload.filename);
     uploadFilePath = "/uploads/" + uploadFileName;
 
@@ -759,8 +799,13 @@ void handleFileUpload()
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
+      uint32_t ulMs = millis() - uploadStartMs;
+      float ulSec = ulMs / 1000.0f;
+      float ulKBs = (ulSec > 0) ? (uploadBytes / 1024.0f / ulSec) : 0;
       startTransferLed();
-      Serial.printf("[UPLOAD] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
+      Serial.printf("[UPLOAD] OK %s | %llu bytes | %.2f s | %.1f KB/s\n",
+                    uploadFileName.c_str(), (unsigned long long)uploadBytes, ulSec, ulKBs);
+      logTransfer("HTTP_UP", uploadFileName, uploadBytes, ulSec, ulKBs, "ok");
       endTransferLed();
     }
     else
@@ -829,6 +874,7 @@ void handleFileUploadAll()
     uploadOK = false;
     uploadError = "";
     uploadBytes = 0;
+    uploadStartMs = millis();
     uploadFileName = safeFileName(upload.filename);
     uploadFilePath = "/uploads/" + uploadFileName;
 
@@ -884,8 +930,13 @@ void handleFileUploadAll()
       uploadOK = true;
       uploadAllOK++;
       uploadAllBytes += uploadBytes;
+      uint32_t ulMs = millis() - uploadStartMs;
+      float ulSec = ulMs / 1000.0f;
+      float ulKBs = (ulSec > 0) ? (uploadBytes / 1024.0f / ulSec) : 0;
       startTransferLed();
-      Serial.printf("[UPLOAD-ALL] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
+      Serial.printf("[UPLOAD-ALL] OK %s | %llu bytes | %.2f s | %.1f KB/s\n",
+                    uploadFileName.c_str(), (unsigned long long)uploadBytes, ulSec, ulKBs);
+      logTransfer("HTTP_UP_ALL", uploadFileName, uploadBytes, ulSec, ulKBs, "ok");
       endTransferLed();
     }
     else
@@ -1295,6 +1346,7 @@ void processSerialCommand(const String &line)
     _serialDownSize = _serialDownFile.size();
     _serialDownRead = 0;
     _serialDownChunks = (_serialDownSize + SERIAL_DOWN_CHUNK - 1) / SERIAL_DOWN_CHUNK;
+    _serialDownStartMs = millis();
     setTransferLed(true);
     Serial.println("{\"ok\":true,\"name\":\"" + jsonEscape(name) + "\",\"size\":" + String((unsigned long)_serialDownSize) + ",\"chunks\":" + String(_serialDownChunks) + "}");
     return;
@@ -1319,9 +1371,16 @@ void processSerialCommand(const String &line)
     {
       _serialDownFile.close();
       SD.remove("/uploads/" + _serialDownName);
+      uint32_t dlMs = millis() - _serialDownStartMs;
+      float dlSec = dlMs / 1000.0f;
+      float dlKBs = (dlSec > 0) ? (_serialDownSize / 1024.0f / dlSec) : 0;
+      Serial.printf("[SERIAL-DOWN] OK %s | %lu bytes | %.2f s | %.1f KB/s\n",
+                    _serialDownName.c_str(), (unsigned long)_serialDownSize, dlSec, dlKBs);
+      logTransfer("SERIAL_DOWN", _serialDownName, _serialDownSize, dlSec, dlKBs, "ok");
       _serialDownName = "";
       _serialDownSize = 0;
       _serialDownRead = 0;
+      _serialDownStartMs = 0;
       endTransferLed();
     }
     return;
@@ -1448,6 +1507,7 @@ void processSerialCommand(const String &line)
     _serialUpName = name;
     _serialUpWritten = 0;
     _serialUpTotal = (size_t)_jInt(line, "total");
+    _serialUpStartMs = millis();
     setTransferLed(true);
 
     Serial.println("{\"ok\":true,\"mode\":\"direct_to_sd\",\"max_b64_len\":" + String(SERIAL_B64_MAX_LEN) + "}");
@@ -1535,9 +1595,16 @@ void processSerialCommand(const String &line)
     }
 
     String r = "{\"ok\":true,\"name\":\"" + jsonEscape(_serialUpName) + "\",\"size\":" + String((unsigned long)_serialUpWritten) + ",\"saved_to\":\"/uploads/" + jsonEscape(_serialUpName) + "\"}";
+    uint32_t ulMs = millis() - _serialUpStartMs;
+    float ulSec = ulMs / 1000.0f;
+    float ulKBs = (ulSec > 0) ? (_serialUpWritten / 1024.0f / ulSec) : 0;
+    Serial.printf("[SERIAL-UP] OK %s | %lu bytes | %.2f s | %.1f KB/s\n",
+                  _serialUpName.c_str(), (unsigned long)_serialUpWritten, ulSec, ulKBs);
+    logTransfer("SERIAL_UP", _serialUpName, _serialUpWritten, ulSec, ulKBs, "ok");
     _serialUpName = "";
     _serialUpWritten = 0;
     _serialUpTotal = 0;
+    _serialUpStartMs = 0;
     Serial.println(r);
     endTransferLed();
     return;
@@ -1572,6 +1639,39 @@ void processSerialCommand(const String &line)
     }
     dir.close();
     Serial.println("{\"ok\":" + String(fail_count == 0 ? "true" : "false") + ",\"deleted\":" + String(ok_count) + ",\"failed\":" + String(fail_count) + "}");
+    return;
+  }
+
+  // ── read_log ─────────────────────────────────────────────────────
+  if (cmd == "read_log")
+  {
+    File f = SD.open("/transfer_log.csv", FILE_READ);
+    if (!f)
+    {
+      Serial.println("{\"ok\":false,\"error\":\"log_not_found\"}");
+      return;
+    }
+    String csv = "";
+    while (f.available())
+    {
+      char c = (char)f.read();
+      if (c == '"')       csv += "\\\"";
+      else if (c == '\\') csv += "\\\\";
+      else if (c == '\r') continue;
+      else if (c == '\n') csv += "\\n";
+      else                csv += c;
+    }
+    f.close();
+    Serial.println("{\"ok\":true,\"csv\":\"" + csv + "\"}");
+    return;
+  }
+
+  // ── clear_log ─────────────────────────────────────────────────────
+  if (cmd == "clear_log")
+  {
+    if (SD.exists("/transfer_log.csv"))
+      SD.remove("/transfer_log.csv");
+    Serial.println("{\"ok\":true}");
     return;
   }
 

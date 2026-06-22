@@ -1,37 +1,37 @@
 """
-Phantom Thinker - Quan ly file /uploads tren ESP32-S3 qua COM
-Giao thuc Serial: LIST / STATUS / PING / DELETE / DOWNLOAD / UPLOAD
+Phantom Thinker - Xem Transfer Log tu ESP32-S3 qua COM
 Chay: python gui.py
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox
 import serial
 import serial.tools.list_ports
 import threading
 import json
-import os
 import time
 
-TIMEOUT_S = 8
-CHUNK     = 512
+
+TIMEOUT_S = 10
 
 
 class PhantomThinker:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Phantom Thinker - ESP32 SD Manager")
-        self.root.geometry("900x660")
+        self.root.title("Phantom Thinker - Transfer Log Viewer")
+        self.root.geometry("860x520")
         self.root.resizable(True, True)
 
         self.ser: serial.Serial | None = None
         self._lock = threading.Lock()
+        self._csv_raw = ""
 
         self._build_ui()
         self._refresh_ports()
 
-    # ------------------------------------------------------------------ UI --
+    # ================================================================ UI ===
     def _build_ui(self):
+        # --- thanh ket noi ---
         top = tk.Frame(self.root, pady=6)
         top.pack(fill="x", padx=10)
 
@@ -48,8 +48,7 @@ class PhantomThinker:
         self.cb_baud.set("115200")
         self.cb_baud.pack(side="left", padx=4)
 
-        tk.Button(top, text="Refresh Ports",
-                  command=self._refresh_ports).pack(side="left", padx=4)
+        tk.Button(top, text="Refresh", command=self._refresh_ports).pack(side="left", padx=4)
 
         self.btn_connect = tk.Button(
             top, text="Ket noi", bg="#4caf50", fg="white",
@@ -60,69 +59,43 @@ class PhantomThinker:
         self.lbl_status = tk.Label(top, text="Chua ket noi", fg="gray")
         self.lbl_status.pack(side="left", padx=6)
 
-        mid = tk.PanedWindow(self.root, orient="horizontal", sashrelief="raised")
-        mid.pack(fill="both", expand=True, padx=10, pady=4)
+        # --- thanh cong cu log ---
+        bar = tk.Frame(self.root, pady=4)
+        bar.pack(fill="x", padx=10)
 
-        # --- panel trai: danh sach file ---
-        left = tk.LabelFrame(mid, text="  Files /uploads  ", padx=4, pady=4)
-        mid.add(left, minsize=300)
+        tk.Button(bar, text="Tai lai log", width=12,
+                  command=self._cmd_read_log).pack(side="left", padx=4)
+        tk.Button(bar, text="Xoa log tren ESP32", bg="#f44336", fg="white",
+                  width=20, command=self._cmd_clear_log).pack(side="left", padx=4)
+        tk.Button(bar, text="Luu CSV ra may tinh",
+                  width=20, command=self._export_csv).pack(side="left", padx=4)
 
-        btn_row = tk.Frame(left)
-        btn_row.pack(fill="x", pady=(0, 4))
-        tk.Button(btn_row, text="Lam moi",    width=9,  command=self._cmd_list).pack(side="left", padx=2)
-        tk.Button(btn_row, text="Tai xuong",  width=9,  command=self._cmd_download).pack(side="left", padx=2)
-        tk.Button(btn_row, text="Xoa file",   width=9,  command=self._cmd_delete).pack(side="left", padx=2)
-        tk.Button(btn_row, text="Xoa tat ca", width=10,
-                  bg="#f44336", fg="white",
-                  command=self._cmd_delete_all).pack(side="left", padx=2)
+        self.lbl_count = tk.Label(bar, text="", fg="gray")
+        self.lbl_count.pack(side="left", padx=8)
 
-        cols = ("Filename", "Size")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
-        self.tree.heading("Filename", text="Ten file")
-        self.tree.heading("Size",     text="Kich thuoc")
-        self.tree.column("Filename", width=200, stretch=True)
-        self.tree.column("Size",     width=90, anchor="e", stretch=False)
-        vsb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
+        # --- bang log ---
+        cols    = ("uptime_ms", "type", "filename", "bytes", "duration_s", "speed_kbs", "status")
+        headers = ("Uptime (ms)", "Loai", "Ten file", "Bytes", "Thoi gian (s)", "Toc do (KB/s)", "Trang thai")
+        widths  = [100, 110, 220, 90, 110, 110, 70]
+
+        frame = tk.Frame(self.root)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c, h, w in zip(cols, headers, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w,
+                             anchor="w" if c == "filename" else "e",
+                             stretch=(c == "filename"))
+
+        vsb = ttk.Scrollbar(frame, orient="vertical",   command=self.tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal",  command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
         self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<Double-1>", lambda _: self._cmd_download())
 
-        # --- panel phai: upload + info + log ---
-        right = tk.Frame(mid)
-        mid.add(right, minsize=400)
-
-        up_frame = tk.LabelFrame(right, text="  Upload file len ESP32  ", padx=6, pady=6)
-        up_frame.pack(fill="x", pady=(0, 6))
-        self.entry_upload = tk.Entry(up_frame)
-        self.entry_upload.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        tk.Button(up_frame, text="Chon...",
-                  command=self._browse_upload).pack(side="left", padx=2)
-        tk.Button(up_frame, text="Upload", bg="#2196f3", fg="white",
-                  width=8, command=self._cmd_upload).pack(side="left", padx=4)
-
-        info_frame = tk.LabelFrame(right, text="  Thong tin thiet bi  ", padx=6, pady=4)
-        info_frame.pack(fill="x", pady=(0, 6))
-        btn_inf = tk.Frame(info_frame)
-        btn_inf.pack(side="left")
-        tk.Button(btn_inf, text="STATUS", width=8, command=self._cmd_status).pack(pady=2)
-        tk.Button(btn_inf, text="PING",   width=8, command=self._cmd_ping).pack(pady=2)
-        self.lbl_sdinfo = tk.Label(info_frame, text="(chua lay du lieu)",
-                                   anchor="w", justify="left", fg="gray")
-        self.lbl_sdinfo.pack(side="left", padx=12, fill="x", expand=True)
-
-        log_frame = tk.LabelFrame(right, text="  Log  ", padx=4, pady=4)
-        log_frame.pack(fill="both", expand=True)
-        self.log_box = scrolledtext.ScrolledText(
-            log_frame, height=14, state="disabled",
-            font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4"
-        )
-        self.log_box.pack(fill="both", expand=True)
-
-        self.progress = ttk.Progressbar(self.root, mode="determinate")
-        self.progress.pack(fill="x", padx=10, pady=(0, 6))
-
-    # ------------------------------------------------------- port helpers ---
+    # ============================================================ helpers ===
     def _refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
         self.cb_port["values"] = ports
@@ -144,9 +117,10 @@ class PhantomThinker:
         try:
             self.ser = serial.Serial(port, baud, timeout=TIMEOUT_S)
             time.sleep(1.5)
-            self._log(f"[COM] Ket noi {port} @ {baud}")
             self.lbl_status.config(text=f"Da ket noi: {port}", fg="#4caf50")
             self.btn_connect.config(text="Ngat ket noi", bg="#f44336")
+            # Tu dong tai log khi ket noi
+            threading.Thread(target=self._do_read_log, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Loi ket noi", str(e))
 
@@ -159,222 +133,94 @@ class PhantomThinker:
         self.ser = None
         self.lbl_status.config(text="Chua ket noi", fg="gray")
         self.btn_connect.config(text="Ket noi", bg="#4caf50")
-        self._log("[COM] Ngat ket noi")
 
-    # ------------------------------------------------------ serial helpers --
     def _ok(self) -> bool:
         if not self.ser or not self.ser.is_open:
             messagebox.showerror("Loi", "Chua ket noi COM port")
             return False
         return True
 
-    def _send(self, cmd: str):
+    def _send_json(self, obj: dict):
         self.ser.reset_input_buffer()
-        self.ser.write((cmd + "\n").encode())
+        self.ser.write((json.dumps(obj, separators=(",", ":")) + "\n").encode())
 
-    def _readline(self) -> str:
-        return self.ser.readline().decode(errors="replace").strip()
+    def _recv_json(self) -> dict:
+        deadline = time.time() + TIMEOUT_S
+        while time.time() < deadline:
+            raw = self.ser.readline().decode(errors="replace").strip()
+            if raw.startswith("{"):
+                return json.loads(raw)
+        raise TimeoutError("Khong nhan duoc phan hoi")
 
-    def _log(self, msg: str):
-        def _do():
-            self.log_box.config(state="normal")
-            ts = time.strftime("%H:%M:%S")
-            self.log_box.insert("end", f"[{ts}] {msg}\n")
-            self.log_box.see("end")
-            self.log_box.config(state="disabled")
-        self.root.after(0, _do)
-
-    def _thread(self, fn, *args):
-        threading.Thread(target=fn, args=args, daemon=True).start()
-
-    # ---------------------------------------------------------- commands ---
-    def _cmd_ping(self):
+    # ===================================================== Transfer Log ===
+    def _cmd_read_log(self):
         if not self._ok(): return
-        self._thread(self._do_ping)
+        threading.Thread(target=self._do_read_log, daemon=True).start()
 
-    def _do_ping(self):
+    def _do_read_log(self):
         with self._lock:
             try:
-                self._send("PING")
-                self._log(f"[PING] {self._readline()}")
+                self._send_json({"cmd": "read_log"})
+                r = self._recv_json()
+                if not r.get("ok"):
+                    err = r.get("error", "")
+                    self.root.after(0, lambda: self.lbl_count.config(
+                        text=f"ERR: {err}", fg="red"))
+                    return
+                csv_text = r.get("csv", "").replace("\\n", "\n").replace("\\\"", "\"")
+                self._csv_raw = csv_text
+                self.root.after(0, lambda: self._populate(csv_text))
             except Exception as e:
-                self._log(f"[PING] ERR: {e}")
+                self.root.after(0, lambda: self.lbl_count.config(
+                    text=f"ERR: {e}", fg="red"))
 
-    def _cmd_status(self):
-        if not self._ok(): return
-        self._thread(self._do_status)
-
-    def _do_status(self):
-        with self._lock:
-            try:
-                self._send("STATUS")
-                raw  = self._readline()
-                data = json.loads(raw)
-                dd   = data.get("dinh_danh", {})
-                info = (
-                    f"SD: {data.get('sd_used_human','?')} / {data.get('sd_total_human','?')}"
-                    f"  [{data.get('sd_card_type','?')}]\n"
-                    f"ID: {dd.get('id_thiet_bi','?')}  |  {dd.get('ho_ten','?')}"
-                )
-                self.root.after(0, lambda: self.lbl_sdinfo.config(text=info, fg="black"))
-                self._log("[STATUS] ok")
-            except Exception as e:
-                self._log(f"[STATUS] ERR: {e}")
-
-    def _cmd_list(self):
-        if not self._ok(): return
-        self._thread(self._do_list)
-
-    def _do_list(self):
-        with self._lock:
-            self._list_locked()
-
-    def _list_locked(self):
-        try:
-            self._send("LIST")
-            raw   = self._readline()
-            data  = json.loads(raw)
-            files = data.get("files", [])
-            self.root.after(0, lambda: self._populate_tree(files))
-            self._log(f"[LIST] {len(files)} file(s)")
-        except Exception as e:
-            self._log(f"[LIST] ERR: {e}")
-
-    def _populate_tree(self, files):
+    def _populate(self, csv_text: str):
         for r in self.tree.get_children():
             self.tree.delete(r)
-        for f in files:
-            self.tree.insert("", "end",
-                             values=(f["name"], f.get("size_human", str(f.get("size", 0)))))
 
-    def _sel_name(self) -> str | None:
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showwarning("Chua chon", "Chon mot file truoc")
-            return None
-        return str(self.tree.item(sel[0])["values"][0])
+        lines = [l for l in csv_text.splitlines() if l.strip()]
+        if not lines:
+            self.lbl_count.config(text="(chua co du lieu)", fg="gray")
+            return
 
-    def _cmd_download(self):
+        data_lines = lines[1:] if lines[0].startswith("uptime") else lines
+        for line in data_lines:
+            parts = line.split(",")
+            if len(parts) >= 7:
+                self.tree.insert("", "end", values=tuple(parts[:7]))
+
+        self.lbl_count.config(text=f"{len(data_lines)} ban ghi", fg="black")
+
+    def _cmd_clear_log(self):
         if not self._ok(): return
-        name = self._sel_name()
-        if not name: return
-        dest = filedialog.asksaveasfilename(initialfile=name,
-                                            title="Luu file ve may tinh")
+        if not messagebox.askyesno("Xac nhan", "Xoa log tren ESP32?\nKhong the hoan tac!"): return
+        threading.Thread(target=self._do_clear_log, daemon=True).start()
+
+    def _do_clear_log(self):
+        with self._lock:
+            try:
+                self._send_json({"cmd": "clear_log"})
+                r = self._recv_json()
+                if r.get("ok"):
+                    self._csv_raw = ""
+                    self.root.after(0, lambda: self._populate(""))
+            except Exception as e:
+                self.root.after(0, lambda: self.lbl_count.config(
+                    text=f"ERR: {e}", fg="red"))
+
+    def _export_csv(self):
+        if not self._csv_raw:
+            messagebox.showinfo("Thong bao", "Chua co du lieu. Ket noi va tai log truoc.")
+            return
+        dest = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="transfer_log.csv",
+            title="Luu CSV ra may tinh"
+        )
         if not dest: return
-        self._thread(self._do_download, name, dest)
-
-    def _do_download(self, name: str, dest: str):
-        with self._lock:
-            try:
-                self._send(f"DOWNLOAD:{name}")
-                hdr = self._readline()
-                if not hdr.startswith("SIZE:"):
-                    self._log(f"[DOWNLOAD] ERR: {hdr}")
-                    return
-                total = int(hdr[5:])
-                self._log(f"[DOWNLOAD] {name}  {total} bytes ...")
-                self.root.after(0, lambda: self.progress.config(maximum=max(total, 1), value=0))
-
-                received = 0
-                with open(dest, "wb") as fout:
-                    while received < total:
-                        need  = min(CHUNK, total - received)
-                        chunk = self.ser.read(need)
-                        if not chunk:
-                            self._log("[DOWNLOAD] ERR: timeout")
-                            return
-                        fout.write(chunk)
-                        received += len(chunk)
-                        v = received
-                        self.root.after(0, lambda x=v: self.progress.config(value=x))
-
-                done = self._readline()
-                self.root.after(0, lambda: self.progress.config(value=0))
-                self._log(f"[DOWNLOAD] OK  {os.path.basename(dest)}  ({done})")
-            except Exception as e:
-                self._log(f"[DOWNLOAD] ERR: {e}")
-
-    def _cmd_delete(self):
-        if not self._ok(): return
-        name = self._sel_name()
-        if not name: return
-        if not messagebox.askyesno("Xac nhan", f"Xoa file:\n{name}"):
-            return
-        self._thread(self._do_delete, name)
-
-    def _do_delete(self, name: str):
-        with self._lock:
-            try:
-                self._send(f"DELETE:{name}")
-                resp = self._readline()
-                self._log(f"[DELETE] {resp}")
-                if resp.startswith("OK"):
-                    self._list_locked()
-            except Exception as e:
-                self._log(f"[DELETE] ERR: {e}")
-
-    def _cmd_delete_all(self):
-        if not self._ok(): return
-        if not messagebox.askyesno("Xac nhan",
-                                   "Xoa TAT CA file trong /uploads?\nKhong the hoan tac!"):
-            return
-        self._thread(self._do_delete_all)
-
-    def _do_delete_all(self):
-        with self._lock:
-            try:
-                self._send("DELETE_ALL")
-                resp = self._readline()
-                self._log(f"[DELETE_ALL] {resp}")
-                self._list_locked()
-            except Exception as e:
-                self._log(f"[DELETE_ALL] ERR: {e}")
-
-    def _browse_upload(self):
-        path = filedialog.askopenfilename(title="Chon file can upload len ESP32")
-        if path:
-            self.entry_upload.delete(0, "end")
-            self.entry_upload.insert(0, path)
-
-    def _cmd_upload(self):
-        if not self._ok(): return
-        path = self.entry_upload.get().strip()
-        if not path or not os.path.isfile(path):
-            messagebox.showerror("Loi", f"File khong ton tai:\n{path}")
-            return
-        self._thread(self._do_upload, path)
-
-    def _do_upload(self, path: str):
-        with self._lock:
-            name = os.path.basename(path)
-            size = os.path.getsize(path)
-            self._log(f"[UPLOAD] {name}  {size} bytes ...")
-            try:
-                self._send(f"UPLOAD:{name}:{size}")
-                ack = self._readline()
-                if ack != "READY":
-                    self._log(f"[UPLOAD] ERR: {ack}")
-                    return
-
-                self.root.after(0, lambda: self.progress.config(maximum=max(size, 1), value=0))
-                sent = 0
-                with open(path, "rb") as fin:
-                    while True:
-                        chunk = fin.read(CHUNK)
-                        if not chunk:
-                            break
-                        self.ser.write(chunk)
-                        sent += len(chunk)
-                        v = sent
-                        self.root.after(0, lambda x=v: self.progress.config(value=x))
-
-                resp = self._readline()
-                self.root.after(0, lambda: self.progress.config(value=0))
-                self._log(f"[UPLOAD] {resp}")
-                if resp.startswith("OK"):
-                    self._list_locked()
-            except Exception as e:
-                self._log(f"[UPLOAD] ERR: {e}")
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(self._csv_raw)
 
 
 if __name__ == "__main__":
