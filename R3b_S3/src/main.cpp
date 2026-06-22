@@ -45,17 +45,16 @@ WebServer server(SERVER_PORT);
 
 // ================== LED STATE ==================
 // Quy ước LED: mỗi thời điểm chỉ có 1 trạng thái màu rõ ràng.
-// VÀNG  = chưa kết nối / đang chờ / vừa lên nguồn
-// XANH  = đúng 1 kết nối qua WiFi hoặc USB CDC
-// ĐỎ    = có từ 2 kết nối trở lên / thiết bị khác đang kết nối thêm
-// TRẮNG = đang truyền file upload/download
+// VÀNG     = bật nguồn / đang phát WiFi AP / chưa có ai kết nối
+// XANH     = có ít nhất 1 kết nối WiFi client / USB CDC / STA đã bắt được WiFi 001
+// ĐỎ       = đang upload hoặc download file
+// ĐỎ NHÁY  = lỗi SD / lỗi WiFi AP
 enum LedState
 {
-  LED_STATE_IDLE,         // Vàng
-  LED_STATE_CONNECTED,    // Xanh
-  LED_STATE_MULTI_CLIENT, // Đỏ
-  LED_STATE_TRANSFER,     // Trắng
-  LED_STATE_ERROR         // Đỏ nháy, dùng trong vòng lặp lỗi
+  LED_STATE_IDLE,      // Vàng
+  LED_STATE_CONNECTED, // Xanh
+  LED_STATE_TRANSFER,  // Đỏ liên tục
+  LED_STATE_ERROR      // Đỏ nháy, dùng trong vòng lặp lỗi
 };
 
 volatile LedState g_ledState = LED_STATE_IDLE;
@@ -84,6 +83,7 @@ File _serialUpFile;
 String _serialUpName = "";
 size_t _serialUpTotal = 0;
 size_t _serialUpWritten = 0;
+uint32_t _serialUpStartMs = 0;
 
 // Serial upload: decode từng chunk nhỏ rồi ghi thẳng xuống SD.
 // Không cấp phát RAM theo kích thước file/chunk nữa.
@@ -337,12 +337,8 @@ void setLedState(LedState st)
     digitalWrite(LED_GREEN, HIGH);
     break;
 
-  case LED_STATE_MULTI_CLIENT:
-    digitalWrite(LED_RED, HIGH);
-    break;
-
   case LED_STATE_TRANSFER:
-    digitalWrite(LED_WHITE, HIGH);
+    digitalWrite(LED_RED, HIGH);
     break;
 
   case LED_STATE_ERROR:
@@ -364,7 +360,7 @@ void setTransferLed(bool active)
 bool isUsbSerialConnected()
 {
 #if ARDUINO_USB_CDC_ON_BOOT
-  return true;
+  return (bool)Serial; // true chỉ khi USB host đang thật sự kết nối
 #else
   return false;
 #endif
@@ -402,17 +398,9 @@ void updateConnectionLed()
   lastClientCount = (currentMode == MODE_AP) ? WiFi.softAPgetStationNum() : 0;
 
   if (totalConnections == 0)
-  {
-    setLedState(LED_STATE_IDLE); // Vàng
-  }
-  else if (totalConnections == 1)
-  {
-    setLedState(LED_STATE_CONNECTED); // Xanh
-  }
+    setLedState(LED_STATE_IDLE); // Vàng: chưa có kết nối
   else
-  {
-    setLedState(LED_STATE_MULTI_CLIENT); // Đỏ
-  }
+    setLedState(LED_STATE_CONNECTED); // Xanh: có ít nhất 1 kết nối
 }
 
 void endTransferLed()
@@ -421,8 +409,7 @@ void endTransferLed()
   updateConnectionLed();
 }
 
-// Giữ tên hàm cũ để không phải đổi nhiều chỗ trong code.
-void startUploadBlinkWhite()
+void startTransferLed()
 {
   setTransferLed(true);
 }
@@ -772,7 +759,7 @@ void handleFileUpload()
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
-      startUploadBlinkWhite();
+      startTransferLed();
       Serial.printf("[UPLOAD] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
       endTransferLed();
     }
@@ -897,7 +884,7 @@ void handleFileUploadAll()
       uploadOK = true;
       uploadAllOK++;
       uploadAllBytes += uploadBytes;
-      startUploadBlinkWhite();
+      startTransferLed();
       Serial.printf("[UPLOAD-ALL] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
       endTransferLed();
     }
@@ -1518,7 +1505,7 @@ void processSerialCommand(const String &line)
       _serialUpFile.flush();
     }
 
-    startUploadBlinkWhite();
+    startTransferLed();
     Serial.println("{\"ok\":true,\"written\":" + String((unsigned long)_serialUpWritten) + "}");
     return;
   }
@@ -1621,17 +1608,19 @@ void handleSerial()
 // ================== SETUP ==================
 void setup()
 {
+  // Tắt LED ngay khi boot, trước cả delay, tránh 3 màu do GPIO boot state.
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_WHITE, OUTPUT);
+  ledAllOff();
+
   Serial.setRxBufferSize(32768);
   Serial.setTxBufferSize(32768);
   Serial.begin(115200);
-  delay(1500);
 
   Serial.println();
   Serial.println("=== ESP32-S3 microSD WIFI SERVER ===");
 
-  pinMode(LED_RED, OUTPUT);
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_WHITE, OUTPUT);
   setLedState(LED_STATE_IDLE);
 
   Serial.println("[SD] Khoi tao SPI...");
