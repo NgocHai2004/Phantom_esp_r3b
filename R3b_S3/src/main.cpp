@@ -34,6 +34,17 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
+// ================== HANDSHAKE SSID LIST ==================
+#include "embedded_ssid_list.h"
+#define SSID_LIST_MAX 100
+String g_ssidList[SSID_LIST_MAX];
+uint8_t g_ssidCount = 0;
+String g_currentApSsid = "";
+int8_t g_lockedIndex = -1;        // -1 = đang ở SSID handshake mặc định 0002
+uint32_t g_lockStartMs = 0;
+bool g_handshakeDone = false;     // true khi đã có R3c STA connect vào SSID động
+#define HANDSHAKE_LOCK_TIMEOUT_MS 30000UL
+
 // ================== TRUSTED WIFI CONFIG ==================
 #define TRUSTED_SSID "7068616e746f6d303030303030300001"
 #define TRUSTED_PASS "12345678"
@@ -262,6 +273,33 @@ bool saveDinhDanhToSD()
            dinhDanh.dia_chi_thiet_bi.c_str());
   f.close();
   return true;
+}
+
+// ================== SSID LIST LOAD ==================
+// Đọc /ssid_list.json trên SD. Format: {"count":N,"ssids":["...","..."]}
+// Nếu thiếu hoặc lỗi, fallback 1 phần tử mặc định 0002 (không handshake được).
+void loadSsidList()
+{
+  // Nạp cứng 100 SSID từ embedded_ssid_list.h (không cần đọc SD).
+  // Vẫn giữ fallback 0002 ở cuối nếu embedded list rỗng.
+  g_ssidCount = 0;
+  g_ssidList[0] = "7068616e746f6d303030303030300002";
+
+  uint8_t cnt = 0;
+  for (size_t i = 0; i < kDefaultSsidCount && cnt < SSID_LIST_MAX; i++)
+  {
+    g_ssidList[cnt] = String(kDefaultSsidList[i]);
+    cnt++;
+  }
+  if (cnt == 0)
+  {
+    Serial.println("[SSID] embedded list empty, fallback to 0002 only");
+    g_ssidCount = 1;
+    return;
+  }
+  g_ssidCount = cnt;
+  Serial.printf("[SSID] Loaded %u SSID from embedded list (first=%s, last=%s)\n",
+                g_ssidCount, g_ssidList[0].c_str(), g_ssidList[g_ssidCount - 1].c_str());
 }
 
 String safeFileName(String name)
@@ -988,24 +1026,79 @@ void notifyTrustedHost()
   Serial.printf("[NOTIFY] POST %s -> %d\n", url.c_str(), code);
   http.end();
 }
-void startAP()
+
+void startAP(const String &ssid)
 {
   server.stop();
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true);
-  delay(300);
+  // Tắt AP/STA an toàn trước khi đổi mode. Đặt mode OFF rồi mới gọi softAPdisconnect/disconnect
+  // để tránh lỗi "STA disconnect failed! 0x3001: ESP_ERR_WIFI_NOT_INIT".
+  WiFi.mode(WIFI_OFF);
+  delay(200);
   ledAllOff();
 
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.softAPConfig(local_IP, gateway, subnet);
-  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+  WiFi.softAP(ssid.c_str(), AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
 
+  g_currentApSsid = ssid;
   currentMode = MODE_AP;
   lastClientCount = 0;
-  Serial.printf("[WIFI] AP: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("[WIFI] AP: %s  IP: %s\n", ssid.c_str(), WiFi.softAPIP().toString().c_str());
   server.begin();
+}
+
+void startAP()
+{
+  // Backward-compat: phát SSID mặc định 0002.
+  startAP(String(AP_SSID));
+}
+
+void revertToHandshakeAP()
+{
+  Serial.println("[HANDSHAKE] timeout -> revert to 0002");
+  g_lockedIndex = -1;
+  g_handshakeDone = false;
+  startAP(String(AP_SSID));
+}
+
+void handleHandshake()
+{
+  String body = server.arg("plain");
+  if (body.length() == 0)
+  {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"empty_body\"}");
+    return;
+  }
+  int idx = _jInt(body, "index");
+  if (idx < 0 || idx >= g_ssidCount)
+  {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_index\"}");
+    return;
+  }
+
+  // Nếu đã có client đang transfer trên SSID động hiện tại → reject để tránh gián đoạn.
+  if (g_lockedIndex >= 0 && g_handshakeDone)
+  {
+    String r = "{\"ok\":false,\"error\":\"busy\",\"locked_index\":" + String(g_lockedIndex) + "}";
+    server.send(409, "application/json", r);
+    return;
+  }
+
+  String newSsid = g_ssidList[idx];
+  Serial.printf("[HANDSHAKE] index=%d -> switch AP to %s (g_ssidCount=%u)\n", idx, newSsid.c_str(), g_ssidCount);
+  g_lockedIndex = (int8_t)idx;
+  g_lockStartMs = millis();
+  g_handshakeDone = false;
+
+  // Gửi response TRƯỚC khi đổi SSID, vì sau khi softAP đổi SSID, client cũ (đang kết nối 0002)
+  // sẽ bị mất kết nối và không nhận được response → gây lỗi "Host is unreachable" ở R3c.
+  String r = "{\"ok\":true,\"index\":" + String(idx) + ",\"ssid\":\"" + jsonEscape(newSsid) + "\"}";
+  server.send(200, "application/json", r);
+  delay(100); // Đợi client nhận xong response trước khi AP đổi SSID.
+
+  startAP(newSsid);
 }
 
 bool connectToTrusted()
@@ -1752,6 +1845,7 @@ void setup()
   }
 
   loadDinhDanhFromSD();
+  loadSsidList();
 
   uint8_t cardType = SD.cardType();
   Serial.print("[SD] Loai the: ");
@@ -1814,13 +1908,12 @@ void setup()
   if (currentMode != MODE_STA)
   {
     Serial.println("[WIFI] Cau hinh IP AP...");
-    WiFi.mode(WIFI_AP);
-    WiFi.setSleep(false);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    WiFi.softAPConfig(local_IP, gateway, subnet);
-    if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN))
+    g_lockedIndex = -1;
+    g_handshakeDone = false;
+    startAP(String(AP_SSID));
+    if (g_currentApSsid.length() == 0)
     {
-      Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
+      // startAP failed
       while (true)
       {
         setLedState(LED_STATE_ERROR);
@@ -1830,8 +1923,6 @@ void setup()
       }
     }
     updateConnectionLed();
-    Serial.printf("[WIFI] SSID: %s  IP: %s  PORT: %d\n",
-                  AP_SSID, WiFi.softAPIP().toString().c_str(), SERVER_PORT);
   }
 
   setWifiLedByClient();
@@ -1856,6 +1947,8 @@ void setup()
 
   server.on("/api/device-info", HTTP_GET, handleDeviceInfo);
 
+  server.on("/api/handshake", HTTP_POST, handleHandshake);
+
   server.onNotFound(handleNotFound);
 
   server.begin();
@@ -1873,6 +1966,20 @@ void loop()
   handleSerial();
 
   unsigned long now = millis();
+
+  // Handshake lock timeout: nếu đã đổi SSID cho client nhưng 30s không có STA connect → revert.
+  if (currentMode == MODE_AP && g_lockedIndex >= 0 && !g_handshakeDone)
+  {
+    if (WiFi.softAPgetStationNum() > 0)
+    {
+      g_handshakeDone = true;
+      Serial.printf("[HANDSHAKE] client connected to locked SSID index=%d\n", g_lockedIndex);
+    }
+    else if (now - g_lockStartMs > HANDSHAKE_LOCK_TIMEOUT_MS)
+    {
+      revertToHandshakeAP();
+    }
+  }
 
   if (currentMode == MODE_STA)
   {
