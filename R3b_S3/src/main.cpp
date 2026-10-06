@@ -24,8 +24,8 @@ uint32_t mountedSDFreq = 0;
 #define LED_WHITE 48
 
 // ================== WIFI AP CONFIG ==================
-const char *AP_SSID = "7068616e746f6d303030303030300002";
-const char *AP_PASS = "12345678";
+const char *AP_SSID = "1A3bcba8b69c7aea0c5942b5ce87f102";
+const char *AP_PASS = "d1b07167d06adf161a21d4096041d40b";
 
 IPAddress local_IP(10, 42, 0, 1);
 IPAddress gateway(10, 42, 0, 1);
@@ -34,21 +34,23 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
-// ================== HANDSHAKE SSID LIST ==================
-#include "embedded_ssid_list.h"
-#define SSID_LIST_MAX 100
-String g_ssidList[SSID_LIST_MAX];
-uint8_t g_ssidCount = 0;
+// ================== HANDSHAKE SSID LIST (BINARY FILE O(1) SEEK) ==================
+#define SSID_RECORD_SIZE 64
+#define SSID_LIST_MAX 100000UL
+uint32_t g_ssidCount = 0;
 String g_currentApSsid = "";
-int8_t g_lockedIndex = -1;        // -1 = đang ở SSID handshake mặc định 0002
+String g_currentApPass = "";
+int32_t g_lockedIndex = -1;        // -1 = đang ở SSID handshake mặc định
 uint32_t g_lockStartMs = 0;
 bool g_handshakeDone = false;     // true khi đã có R3c STA connect vào SSID động
 #define HANDSHAKE_LOCK_TIMEOUT_MS 30000UL
 
 // ================== TRUSTED WIFI CONFIG ==================
-#define TRUSTED_SSID "7068616e746f6d303030303030300001"
-#define TRUSTED_PASS "12345678"
-#define SCAN_INTERVAL_MS 10000UL
+// AP nay la WiFi an: beacon khong mang SSID nen scanNetworks() tra ve ten rong.
+// Khong duoc dung ket qua scan de kiem tra ton tai; phai WiFi.begin() truc tiep.
+#define TRUSTED_SSID "1A00a60d349d091982c62e3b7561c38f"
+#define TRUSTED_PASS "afd4fa706f49d71cc98d2a7a87284a7a"
+#define SCAN_INTERVAL_MS 30000UL
 #define STA_CONNECT_TIMEOUT_MS 10000UL
 #define AP_CHANNEL 1
 #define AP_HIDDEN true
@@ -225,6 +227,35 @@ static int _jInt(const String &j, const String &key)
   return v.length() ? v.toInt() : -1;
 }
 
+// Trích giá trị của "elemKey" trong object thứ "idx" của mảng "arrKey".
+// Dùng cho ssid_list.json: {"count":N,"ssids":[{"ssid":"..","pass":".."},...]}
+static String _jArrStr(const String &j, const String &arrKey, const String &elemKey, int idx)
+{
+  int p = j.indexOf("\"" + arrKey + "\"");
+  if (p < 0)
+    return "";
+  p = j.indexOf('[', p + arrKey.length() + 2);
+  if (p < 0)
+    return "";
+  // Lặp qua từng object {...} trong mảng, đếm đến idx.
+  int cur = -1;
+  while (true)
+  {
+    p = j.indexOf('{', p + 1);
+    if (p < 0)
+      return "";
+    cur++;
+    if (cur == idx)
+    {
+      int close = j.indexOf('}', p);
+      if (close < 0)
+        return "";
+      String obj = j.substring(p, close + 1);
+      return _jStr(obj, elemKey);
+    }
+  }
+}
+
 void loadDinhDanhFromSD()
 {
   File f = SD.open("/dinh_danh.json", FILE_READ);
@@ -275,31 +306,75 @@ bool saveDinhDanhToSD()
   return true;
 }
 
-// ================== SSID LIST LOAD ==================
-// Đọc /ssid_list.json trên SD. Format: {"count":N,"ssids":["...","..."]}
-// Nếu thiếu hoặc lỗi, fallback 1 phần tử mặc định 0002 (không handshake được).
+// ================== SSID LIST BINARY LOAD & SEEK ==================
+// Đọc (ssid, pass) tại index bất kỳ từ /ssid_list.bin trên SD. O(1) seek, 0 bytes RAM.
+bool getSsidEntry(uint32_t idx, String &outSsid, String &outPass)
+{
+  if (idx == 0)
+  {
+    outSsid = String(AP_SSID);
+    outPass = String(AP_PASS);
+    return true;
+  }
+  File f = SD.open("/ssid_list.bin", FILE_READ);
+  if (!f)
+  {
+    outSsid = String(AP_SSID);
+    outPass = String(AP_PASS);
+    return false;
+  }
+  if (!f.seek((uint32_t)idx * SSID_RECORD_SIZE))
+  {
+    f.close();
+    outSsid = String(AP_SSID);
+    outPass = String(AP_PASS);
+    return false;
+  }
+  char buf[SSID_RECORD_SIZE + 1];
+  memset(buf, 0, sizeof(buf));
+  int n = f.read((uint8_t *)buf, SSID_RECORD_SIZE);
+  f.close();
+  if (n != SSID_RECORD_SIZE)
+  {
+    outSsid = String(AP_SSID);
+    outPass = String(AP_PASS);
+    return false;
+  }
+  char sBuf[33];
+  char pBuf[33];
+  memcpy(sBuf, buf, 32);
+  sBuf[32] = '\0';
+  memcpy(pBuf, buf + 32, 32);
+  pBuf[32] = '\0';
+  outSsid = String(sBuf);
+  outPass = String(pBuf);
+  return true;
+}
+
 void loadSsidList()
 {
-  // Nạp cứng 100 SSID từ embedded_ssid_list.h (không cần đọc SD).
-  // Vẫn giữ fallback 0002 ở cuối nếu embedded list rỗng.
   g_ssidCount = 0;
-  g_ssidList[0] = "7068616e746f6d303030303030300002";
-
-  uint8_t cnt = 0;
-  for (size_t i = 0; i < kDefaultSsidCount && cnt < SSID_LIST_MAX; i++)
+  File f = SD.open("/ssid_list.bin", FILE_READ);
+  if (f)
   {
-    g_ssidList[cnt] = String(kDefaultSsidList[i]);
-    cnt++;
+    size_t sz = f.size();
+    f.close();
+    g_ssidCount = sz / SSID_RECORD_SIZE;
+    if (g_ssidCount > SSID_LIST_MAX)
+      g_ssidCount = SSID_LIST_MAX;
+    if (g_ssidCount > 0)
+    {
+      String firstSsid, firstPass, lastSsid, lastPass;
+      getSsidEntry(0, firstSsid, firstPass);
+      getSsidEntry(g_ssidCount - 1, lastSsid, lastPass);
+      Serial.printf("[SSID] Loaded %u (ssid,pass) from /ssid_list.bin (first=%s, last=%s)\n",
+                    g_ssidCount, firstSsid.c_str(), lastSsid.c_str());
+      return;
+    }
   }
-  if (cnt == 0)
-  {
-    Serial.println("[SSID] embedded list empty, fallback to 0002 only");
-    g_ssidCount = 1;
-    return;
-  }
-  g_ssidCount = cnt;
-  Serial.printf("[SSID] Loaded %u SSID from embedded list (first=%s, last=%s)\n",
-                g_ssidCount, g_ssidList[0].c_str(), g_ssidList[g_ssidCount - 1].c_str());
+  // Fallback: chỉ 1 SSID khởi điểm AP_SSID + pass AP_PASS.
+  g_ssidCount = 1;
+  Serial.printf("[SSID] Fallback single AP: %s\n", AP_SSID);
 }
 
 String safeFileName(String name)
@@ -511,6 +586,14 @@ void handleRoot()
   server.send(200, "text/plain", msg);
 }
 
+// Pass tương ứng với SSID đang phát (g_currentApSsid), fallback AP_PASS.
+String passForCurrentAp()
+{
+  if (g_currentApPass.length() > 0)
+    return g_currentApPass;
+  return String(AP_PASS);
+}
+
 void handleStatus()
 {
   uint8_t cardType = SD.cardType();
@@ -532,8 +615,8 @@ void handleStatus()
   json += "\"wifi_mode\":\"" + String(currentMode == MODE_STA ? "STA" : "AP") + "\",";
   json += "\"ip\":\"" + ip + "\",";
   json += "\"port\":" + String(SERVER_PORT) + ",";
-  json += "\"ap_ssid\":\"" + jsonEscape(String(AP_SSID)) + "\",";
-  json += "\"ap_pass\":\"" + jsonEscape(String(AP_PASS)) + "\",";
+  json += "\"ap_ssid\":\"" + jsonEscape(g_currentApSsid.length() ? g_currentApSsid : String(AP_SSID)) + "\",";
+  json += "\"ap_pass\":\"" + jsonEscape(passForCurrentAp()) + "\",";
   json += "\"sd_card_type\":\"" + card + "\",";
   json += "\"sd_spi_hz\":" + String((unsigned long)mountedSDFreq) + ",";
   json += "\"sd_total\":" + String((unsigned long long)getTotalBytes()) + ",";
@@ -1027,7 +1110,7 @@ void notifyTrustedHost()
   http.end();
 }
 
-void startAP(const String &ssid)
+void startAP(const String &ssid, const String &pass)
 {
   server.stop();
   // Tắt AP/STA an toàn trước khi đổi mode. Đặt mode OFF rồi mới gọi softAPdisconnect/disconnect
@@ -1040,9 +1123,10 @@ void startAP(const String &ssid)
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.softAPConfig(local_IP, gateway, subnet);
-  WiFi.softAP(ssid.c_str(), AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+  WiFi.softAP(ssid.c_str(), pass.c_str(), AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
 
   g_currentApSsid = ssid;
+  g_currentApPass = pass;
   currentMode = MODE_AP;
   lastClientCount = 0;
   Serial.printf("[WIFI] AP: %s  IP: %s\n", ssid.c_str(), WiFi.softAPIP().toString().c_str());
@@ -1051,16 +1135,18 @@ void startAP(const String &ssid)
 
 void startAP()
 {
-  // Backward-compat: phát SSID mặc định 0002.
-  startAP(String(AP_SSID));
+  // Phát SSID khởi điểm (phần tử đầu list) với pass riêng của nó.
+  String defSsid, defPass;
+  getSsidEntry(0, defSsid, defPass);
+  startAP(defSsid, defPass);
 }
 
 void revertToHandshakeAP()
 {
-  Serial.println("[HANDSHAKE] timeout -> revert to 0002");
+  Serial.println("[HANDSHAKE] timeout -> revert to default AP");
   g_lockedIndex = -1;
   g_handshakeDone = false;
-  startAP(String(AP_SSID));
+  startAP();
 }
 
 void handleHandshake()
@@ -1071,12 +1157,13 @@ void handleHandshake()
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"empty_body\"}");
     return;
   }
-  int idx = _jInt(body, "index");
-  if (idx < 0 || idx >= g_ssidCount)
+  long idxVal = _jInt(body, "index");
+  if (idxVal < 0 || (uint32_t)idxVal >= g_ssidCount)
   {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_index\"}");
     return;
   }
+  uint32_t idx = (uint32_t)idxVal;
 
   // Nếu đã có client đang transfer trên SSID động hiện tại → reject để tránh gián đoạn.
   if (g_lockedIndex >= 0 && g_handshakeDone)
@@ -1086,27 +1173,38 @@ void handleHandshake()
     return;
   }
 
-  String newSsid = g_ssidList[idx];
-  Serial.printf("[HANDSHAKE] index=%d -> switch AP to %s (g_ssidCount=%u)\n", idx, newSsid.c_str(), g_ssidCount);
-  g_lockedIndex = (int8_t)idx;
+  String newSsid, newPass;
+  if (!getSsidEntry(idx, newSsid, newPass))
+  {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"read_ssid_fail\"}");
+    return;
+  }
+
+  Serial.printf("[HANDSHAKE] index=%u -> switch AP to %s (g_ssidCount=%u)\n", idx, newSsid.c_str(), g_ssidCount);
+  g_lockedIndex = (int32_t)idx;
   g_lockStartMs = millis();
   g_handshakeDone = false;
 
   // Gửi response TRƯỚC khi đổi SSID, vì sau khi softAP đổi SSID, client cũ (đang kết nối 0002)
-  // sẽ bị mất kết nối và không nhận được response → gây lỗi "Host is unreachable" ở R3c.
+  // sẽ bị mất kết nối và không nhận được response → gây lỗi "Host is unreachable" ở R3c/R3a.
   String r = "{\"ok\":true,\"index\":" + String(idx) + ",\"ssid\":\"" + jsonEscape(newSsid) + "\"}";
   server.send(200, "application/json", r);
   delay(100); // Đợi client nhận xong response trước khi AP đổi SSID.
 
-  startAP(newSsid);
+  startAP(newSsid, newPass);
 }
 
 bool connectToTrusted()
 {
   server.stop();
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true);
-  delay(300);
+  // Core 3.x: softAPdisconnect(true) -> AP.end() deinit ca WiFi stack, nen goi
+  // tiep disconnect() khi stack da chet se tra ESP_ERR_WIFI_NOT_INIT (0x3001).
+  if (WiFi.getMode() != WIFI_MODE_NULL)
+  {
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true);
+    delay(300);
+  }
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("PhantomR3b");
@@ -1135,29 +1233,16 @@ bool connectToTrusted()
 
 void doWifiScan()
 {
-  Serial.println("[SCAN] Quet WiFi tim trusted AP...");
-  int n = WiFi.scanNetworks(false, true);
-  bool found = false;
+  // TRUSTED_SSID chi phat khi may PC phat hien USB serial cua thiet bi nay.
+  // Chua cam USB -> AP do khong ton tai, thu ket noi chi lam mat AP + timeout vo ich.
+  if (!isUsbSerialConnected())
+    return;
 
-  for (int i = 0; i < n; i++)
-  {
-    if (WiFi.SSID(i) == TRUSTED_SSID)
-    {
-      found = true;
-      break;
-    }
-  }
-  WiFi.scanDelete();
-
-  if (found)
-  {
-    Serial.println("[SCAN] Tim thay trusted AP, chuyen sang STA.");
-    connectToTrusted();
-  }
-  else
-  {
-    Serial.println("[SCAN] Khong tim thay, giu AP.");
-  }
+  // TRUSTED_SSID la AP an -> khong the xac nhan bang scan (WiFi.SSID(i) rong).
+  // Thu ket noi truc tiep: WiFi.begin() gui probe request co ten nen tim duoc AP an.
+  // connectToTrusted() tu quay ve startAP() khi timeout.
+  Serial.println("[SCAN] USB da cam -> thu ket noi trusted AP an...");
+  connectToTrusted();
 }
 
 void checkSTAConnection()
@@ -1861,24 +1946,15 @@ void setup()
   Serial.printf("[SD] Total: %s  Used: %s\n",
                 humanSize(SD.totalBytes()).c_str(), humanSize(SD.usedBytes()).c_str());
 
-  Serial.println("[WIFI] Quet WiFi tim trusted AP...");
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("PhantomR3b");
-  int n = WiFi.scanNetworks(false, true);
-  bool trustedFound = false;
-  for (int i = 0; i < n; i++)
+  // TRUSTED_SSID an -> khong xac nhan bang scan, ket noi truc tiep roi cho timeout.
+  // Nhung AP nay chi bat khi PC thay USB serial: chua cam USB thi bo qua, len AP luon.
+  if (isUsbSerialConnected())
   {
-    if (WiFi.SSID(i) == TRUSTED_SSID)
-    {
-      trustedFound = true;
-      break;
-    }
-  }
-  WiFi.scanDelete();
+    Serial.println("[WIFI] USB da cam -> thu ket noi trusted AP an...");
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname("PhantomR3b");
 
-  if (trustedFound)
-  {
-    Serial.println("[WIFI] Tim thay trusted AP, ket noi STA...");
+    Serial.println("[WIFI] Ket noi STA...");
     WiFi.setSleep(false);
     WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
     unsigned long t = millis();
@@ -1910,7 +1986,7 @@ void setup()
     Serial.println("[WIFI] Cau hinh IP AP...");
     g_lockedIndex = -1;
     g_handshakeDone = false;
-    startAP(String(AP_SSID));
+    startAP();
     if (g_currentApSsid.length() == 0)
     {
       // startAP failed
@@ -1973,7 +2049,7 @@ void loop()
     if (WiFi.softAPgetStationNum() > 0)
     {
       g_handshakeDone = true;
-      Serial.printf("[HANDSHAKE] client connected to locked SSID index=%d\n", g_lockedIndex);
+      Serial.printf("[HANDSHAKE] client connected to locked SSID index=%ld\n", (long)g_lockedIndex);
     }
     else if (now - g_lockStartMs > HANDSHAKE_LOCK_TIMEOUT_MS)
     {
