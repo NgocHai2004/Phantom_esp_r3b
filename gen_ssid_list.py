@@ -10,7 +10,6 @@ import random
 import time
 
 TOTAL_COUNT = 100000
-RECORD_SIZE = 64  # 32 bytes SSID + 32 bytes Pass
 
 DEFAULT_ENTRY = {
     "ssid": "1A3bcba8b69c7aea0c5942b5ce87f102",

@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include <LittleFS.h>
 
 // ================== microSD PIN - ESP32-S3 ==================
 #define SD_CS 10
@@ -170,12 +171,12 @@ void logTransfer(const char *type, const String &name, uint64_t bytes, float sec
 struct DinhDanh
 {
   String ma_id = "BN-0001";
-  String ho_ten = "Nguyen Van A";
+  String ho_ten = "Nguyen Ngoc Hai";
   int nam_sinh = 1990;
   String dia_chi = "Ha Noi";
   String ngay_cap_dinh_danh = "2026-05-30";
-  String ten_thiet_bi = "Pi Zero 2W";
-  String id_thiet_bi = "DEVICE-0001";
+  String ten_thiet_bi = "PhantomR3b";
+  String id_thiet_bi = "001";
   String dia_chi_thiet_bi = "Ha Noi";
 };
 
@@ -225,35 +226,6 @@ static int _jInt(const String &j, const String &key)
   while (p < (int)j.length() && j[p] >= '0' && j[p] <= '9')
     v += j[p++];
   return v.length() ? v.toInt() : -1;
-}
-
-// Trích giá trị của "elemKey" trong object thứ "idx" của mảng "arrKey".
-// Dùng cho ssid_list.json: {"count":N,"ssids":[{"ssid":"..","pass":".."},...]}
-static String _jArrStr(const String &j, const String &arrKey, const String &elemKey, int idx)
-{
-  int p = j.indexOf("\"" + arrKey + "\"");
-  if (p < 0)
-    return "";
-  p = j.indexOf('[', p + arrKey.length() + 2);
-  if (p < 0)
-    return "";
-  // Lặp qua từng object {...} trong mảng, đếm đến idx.
-  int cur = -1;
-  while (true)
-  {
-    p = j.indexOf('{', p + 1);
-    if (p < 0)
-      return "";
-    cur++;
-    if (cur == idx)
-    {
-      int close = j.indexOf('}', p);
-      if (close < 0)
-        return "";
-      String obj = j.substring(p, close + 1);
-      return _jStr(obj, elemKey);
-    }
-  }
 }
 
 void loadDinhDanhFromSD()
@@ -307,7 +279,9 @@ bool saveDinhDanhToSD()
 }
 
 // ================== SSID LIST BINARY LOAD & SEEK ==================
-// Đọc (ssid, pass) tại index bất kỳ từ /ssid_list.bin trên SD. O(1) seek, 0 bytes RAM.
+// Đọc (ssid, pass) tại index bất kỳ từ Flash LittleFS hoặc /ssid_list.bin trên SD. O(1) seek, 0 bytes RAM.
+bool g_ssidSourceFlash = false;
+
 bool getSsidEntry(uint32_t idx, String &outSsid, String &outPass)
 {
   if (idx == 0)
@@ -316,7 +290,17 @@ bool getSsidEntry(uint32_t idx, String &outSsid, String &outPass)
     outPass = String(AP_PASS);
     return true;
   }
-  File f = SD.open("/ssid_list.bin", FILE_READ);
+
+  File f;
+  if (g_ssidSourceFlash)
+  {
+    f = LittleFS.open("/ssid_list.bin", "r");
+  }
+  else
+  {
+    f = SD.open("/ssid_list.bin", FILE_READ);
+  }
+
   if (!f)
   {
     outSsid = String(AP_SSID);
@@ -354,6 +338,33 @@ bool getSsidEntry(uint32_t idx, String &outSsid, String &outPass)
 void loadSsidList()
 {
   g_ssidCount = 0;
+  g_ssidSourceFlash = false;
+
+  // 1. Ưu tiên đọc từ bộ nhớ Flash nội bộ (LittleFS) - an toàn, không thể tháo rời
+  if (LittleFS.exists("/ssid_list.bin"))
+  {
+    File f = LittleFS.open("/ssid_list.bin", "r");
+    if (f)
+    {
+      size_t sz = f.size();
+      f.close();
+      g_ssidCount = sz / SSID_RECORD_SIZE;
+      if (g_ssidCount > SSID_LIST_MAX)
+        g_ssidCount = SSID_LIST_MAX;
+      if (g_ssidCount > 0)
+      {
+        g_ssidSourceFlash = true;
+        String firstSsid, firstPass, lastSsid, lastPass;
+        getSsidEntry(0, firstSsid, firstPass);
+        getSsidEntry(g_ssidCount - 1, lastSsid, lastPass);
+        Serial.printf("[SSID] Loaded %u (ssid,pass) from internal Flash LittleFS (first=%s, last=%s)\n",
+                      g_ssidCount, firstSsid.c_str(), lastSsid.c_str());
+        return;
+      }
+    }
+  }
+
+  // 2. Dự phòng: nếu Flash chưa nạp, đọc từ thẻ nhớ MicroSD
   File f = SD.open("/ssid_list.bin", FILE_READ);
   if (f)
   {
@@ -364,15 +375,17 @@ void loadSsidList()
       g_ssidCount = SSID_LIST_MAX;
     if (g_ssidCount > 0)
     {
+      g_ssidSourceFlash = false;
       String firstSsid, firstPass, lastSsid, lastPass;
       getSsidEntry(0, firstSsid, firstPass);
       getSsidEntry(g_ssidCount - 1, lastSsid, lastPass);
-      Serial.printf("[SSID] Loaded %u (ssid,pass) from /ssid_list.bin (first=%s, last=%s)\n",
+      Serial.printf("[SSID] Loaded %u (ssid,pass) from MicroSD card (first=%s, last=%s)\n",
                     g_ssidCount, firstSsid.c_str(), lastSsid.c_str());
       return;
     }
   }
-  // Fallback: chỉ 1 SSID khởi điểm AP_SSID + pass AP_PASS.
+
+  // 3. Fallback: chỉ 1 SSID khởi điểm AP_SSID + pass AP_PASS.
   g_ssidCount = 1;
   Serial.printf("[SSID] Fallback single AP: %s\n", AP_SSID);
 }
@@ -451,7 +464,6 @@ void ledAllOff()
 
 void ledRed(bool on) { digitalWrite(LED_RED, on ? LED_ON : LED_OFF); }
 void ledGreen(bool on) { digitalWrite(LED_GREEN, on ? LED_ON : LED_OFF); }
-void ledWhite(bool on) { digitalWrite(LED_WHITE, on ? LED_ON : LED_OFF); }
 
 void setLedState(LedState st)
 {
@@ -1930,6 +1942,17 @@ void setup()
   }
 
   loadDinhDanhFromSD();
+
+  Serial.println("[FS] Khoi tao LittleFS Flash...");
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("[FS] WARN: Khong the mount LittleFS!");
+  }
+  else
+  {
+    Serial.println("[FS] LittleFS mounted OK");
+  }
+
   loadSsidList();
 
   uint8_t cardType = SD.cardType();

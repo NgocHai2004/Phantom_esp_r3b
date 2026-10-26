@@ -6,7 +6,7 @@ Tài liệu này dành cho thiết bị `...0001` tích hợp các chức năng 
 
 ## Kết nối
 
-Khi node `...0002` kết nối vào WiFi `7068616e746f6d303030303030300001`, nó:
+Khi node `...0002` kết nối vào WiFi `1A00a60d349d091982c62e3b7561c38f` (hoặc khởi tạo AP `1A3bcba8b69c7aea0c5942b5ce87f102`), nó:
 1. Chạy web server trên cổng **8765**
 2. POST sự kiện kết nối lên `...0001` qua `/api/device/connection`
 
@@ -50,8 +50,8 @@ Kiểm tra kết nối, trạng thái thẻ nhớ và thông tin WiFi AP của n
   "wifi_mode": "STA",
   "ip": "192.168.x.x",
   "port": 8765,
-  "ap_ssid": "7068616e746f6d303030303030300002",
-  "ap_pass": "12345678",
+  "ap_ssid": "1A3bcba8b69c7aea0c5942b5ce87f102",
+  "ap_pass": "d1b07167d06adf161a21d4096041d40b",
   "sd_card_type": "SDHC/SDXC",
   "sd_spi_hz": 20000000,
   "sd_total": 31523495936,

@@ -22,11 +22,14 @@
 ## B. FLASH & KHỞI ĐỘNG
 
 - [ ] Build thành công (`pio run` không lỗi)
-- [ ] Upload thành công (`pio run -t upload`)
+- [ ] Nạp LittleFS chứa 100.000 SSID (`pio run --target uploadfs`)
+- [ ] Nạp firmware thành công (`pio run --target upload`)
 - [ ] Mở Serial Monitor (115200 baud)
 - [ ] Thấy dòng `=== ESP32-S3 microSD WIFI SERVER ===`
-- [ ] Thấy `[SD] OK: Mount SD thanh cong o ... Hz`
-- [ ] Thấy `[WIFI] OK: Da phat WiFi AP`
+- [ ] Thấy `[FS] LittleFS mounted OK`
+- [ ] Thấy `[SSID] Loaded 100000 (ssid,pass) from internal Flash LittleFS`
+- [ ] Thấy `[SD] OK: Mount SD thanh cong`
+- [ ] Thấy `[WIFI] Da bat AP: 1A3bcba8b69c7aea0c5942b5ce87f102`
 - [ ] Thấy `=== READY ===`
 
 ---
@@ -34,19 +37,19 @@
 ## C. LED TRẠNG THÁI
 
 - [ ] Khi khởi động: LED RED sáng (đang init)
-- [ ] Sau khi init xong: LED RED tắt
+- [ ] Sau khi init xong: LED RED tắt (về IDLE)
 - [ ] Nếu SD lỗi: LED RED nhấp nháy nhanh (300ms)
 - [ ] Nếu WiFi lỗi: LED RED nhấp nháy chậm (500ms)
-- [ ] Khi có thiết bị kết nối WiFi: LED GREEN sáng
+- [ ] Khi có thiết bị kết nối WiFi / cắm USB: LED GREEN sáng
 - [ ] Khi không có thiết bị nào: LED GREEN tắt
-- [ ] Khi upload file thành công: LED WHITE sáng 500ms rồi tắt
+- [ ] Khi truyền file (upload/download): LED RED sáng liên tục
 
 ---
 
 ## D. WIFI ACCESS POINT
 
-- [ ] Tìm thấy WiFi SSID: `7068616e746f6d303030303030300002`
-- [ ] Kết nối được với mật khẩu: `12345678`
+- [ ] Tìm thấy WiFi SSID khởi điểm: `1A3bcba8b69c7aea0c5942b5ce87f102`
+- [ ] Kết nối được với mật khẩu: `d1b07167d06adf161a21d4096041d40b`
 - [ ] Nhận IP trong dải 10.42.0.x
 - [ ] Ping được 10.42.0.1
 - [ ] Kết nối thiết bị thứ 2 thành công
