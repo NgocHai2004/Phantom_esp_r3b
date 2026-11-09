@@ -6,6 +6,7 @@
 #include <SD.h>
 #include <FS.h>
 #include <LittleFS.h>
+#include <vector>
 
 // ================== microSD PIN - ESP32-S3 ==================
 #define SD_CS 10
@@ -53,6 +54,8 @@ bool g_handshakeDone = false;     // true khi đã có R3c STA connect vào SSID
 #define TRUSTED_PASS "afd4fa706f49d71cc98d2a7a87284a7a"
 #define SCAN_INTERVAL_MS 30000UL
 #define STA_CONNECT_TIMEOUT_MS 10000UL
+#define HEARTBEAT_INTERVAL_MS 15000UL
+unsigned long lastHeartbeatMs = 0;
 #define AP_CHANNEL 1
 #define AP_HIDDEN true
 #define AP_MAX_CONN 2
@@ -778,7 +781,7 @@ void handleDownload()
   setTransferLed(true);
   uint32_t dlStart = millis();
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
-  server.streamFile(file, "application/octet-stream");
+  size_t sentBytes = server.streamFile(file, "application/octet-stream");
   uint32_t dlMs = millis() - dlStart;
   file.close();
   endTransferLed();
@@ -789,8 +792,16 @@ void handleDownload()
                 name.c_str(), (unsigned long long)fileSize, dlSec, dlKBs);
   logTransfer("HTTP_DOWN", name, fileSize, dlSec, dlKBs, "ok");
 
-  SD.remove(path);
-  Serial.printf("[DOWNLOAD] Xoa file sau download: %s\n", name.c_str());
+  if (sentBytes == fileSize)
+  {
+    SD.remove(path);
+    Serial.printf("[DOWNLOAD] Xoa file sau download: %s\n", name.c_str());
+  }
+  else
+  {
+    Serial.printf("[DOWNLOAD] Download chua xong (%u/%llu bytes), giu lai file: %s\n",
+                  (unsigned)sentBytes, (unsigned long long)fileSize, name.c_str());
+  }
 }
 
 void handleDelete()
@@ -824,8 +835,7 @@ void handleDeleteAll()
     return;
   }
 
-  uint32_t deleted = 0, failed = 0;
-
+  std::vector<String> filesToDelete;
   while (true)
   {
     File file = dir.openNextFile();
@@ -836,20 +846,20 @@ void handleDeleteAll()
     {
       String fullName = String(file.name());
       int slash = fullName.lastIndexOf('/');
-      String name = (slash >= 0) ? fullName.substring(slash + 1) : fullName;
-      file.close();
-
-      if (SD.remove("/uploads/" + name))
-        deleted++;
-      else
-        failed++;
+      filesToDelete.push_back((slash >= 0) ? fullName.substring(slash + 1) : fullName);
     }
-    else
-    {
-      file.close();
-    }
+    file.close();
   }
   dir.close();
+
+  uint32_t deleted = 0, failed = 0;
+  for (const String &name : filesToDelete)
+  {
+    if (SD.remove("/uploads/" + name))
+      deleted++;
+    else
+      failed++;
+  }
 
   String json = "{\"ok\":";
   json += (failed == 0 ? "true" : "false");
@@ -1112,14 +1122,23 @@ void notifyTrustedHost()
   String ip = WiFi.localIP().toString();
   String gw = WiFi.gatewayIP().toString();
   String payload = "{\"ip\":\"" + ip + "\",\"type\":\"PhantomR3b\"}";
-  String url = "http://" + gw + ":" + String(SERVER_PORT) + "/api/device/connection";
 
-  HTTPClient http;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(payload);
-  Serial.printf("[NOTIFY] POST %s -> %d\n", url.c_str(), code);
-  http.end();
+  const uint16_t ports[] = {9090, 8765, 8766};
+  for (uint16_t p : ports)
+  {
+    String url = "http://" + gw + ":" + String(p) + "/api/device/connection";
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(1000);
+    int code = http.POST(payload);
+    http.end();
+    if (code > 0)
+    {
+      Serial.printf("[NOTIFY] POST %s -> %d\n", url.c_str(), code);
+      break;
+    }
+  }
 }
 
 void startAP(const String &ssid, const String &pass)
@@ -1206,7 +1225,7 @@ void handleHandshake()
   startAP(newSsid, newPass);
 }
 
-bool connectToTrusted()
+bool connectToTrusted(uint32_t timeoutMs = 4000)
 {
   server.stop();
   // Core 3.x: softAPdisconnect(true) -> AP.end() deinit ca WiFi stack, nen goi
@@ -1215,7 +1234,7 @@ bool connectToTrusted()
   {
     WiFi.softAPdisconnect(true);
     WiFi.disconnect(true);
-    delay(300);
+    delay(200);
   }
 
   WiFi.mode(WIFI_STA);
@@ -1227,13 +1246,13 @@ bool connectToTrusted()
   unsigned long t = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
-    if (millis() - t > STA_CONNECT_TIMEOUT_MS)
+    if (millis() - t > timeoutMs)
     {
       Serial.println("[WIFI] Ket noi that bai, quay ve AP.");
       startAP();
       return false;
     }
-    delay(200);
+    delay(150);
   }
 
   currentMode = MODE_STA;
@@ -1245,16 +1264,13 @@ bool connectToTrusted()
 
 void doWifiScan()
 {
-  // TRUSTED_SSID chi phat khi may PC phat hien USB serial cua thiet bi nay.
-  // Chua cam USB -> AP do khong ton tai, thu ket noi chi lam mat AP + timeout vo ich.
-  if (!isUsbSerialConnected())
+  // Neu dang co client ket noi vao AP cua R3b thi khong ngat AP
+  if (WiFi.softAPgetStationNum() > 0)
     return;
 
-  // TRUSTED_SSID la AP an -> khong the xac nhan bang scan (WiFi.SSID(i) rong).
-  // Thu ket noi truc tiep: WiFi.begin() gui probe request co ten nen tim duoc AP an.
-  // connectToTrusted() tu quay ve startAP() khi timeout.
-  Serial.println("[SCAN] USB da cam -> thu ket noi trusted AP an...");
-  connectToTrusted();
+  // TRUSTED_SSID la AP an do Dongle phat. Thu ket noi truc tiep (probe request).
+  Serial.println("[SCAN] Thu ket noi trusted AP an (Hotspot)...");
+  connectToTrusted(4000);
 }
 
 void checkSTAConnection()
@@ -1263,6 +1279,14 @@ void checkSTAConnection()
   {
     Serial.println("[WIFI] Mat ket noi STA, quay ve AP.");
     startAP();
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)
+  {
+    lastHeartbeatMs = now;
+    notifyTrustedHost();
   }
 }
 
@@ -1969,39 +1993,35 @@ void setup()
   Serial.printf("[SD] Total: %s  Used: %s\n",
                 humanSize(SD.totalBytes()).c_str(), humanSize(SD.usedBytes()).c_str());
 
-  // TRUSTED_SSID an -> khong xac nhan bang scan, ket noi truc tiep roi cho timeout.
-  // Nhung AP nay chi bat khi PC thay USB serial: chua cam USB thi bo qua, len AP luon.
-  if (isUsbSerialConnected())
-  {
-    Serial.println("[WIFI] USB da cam -> thu ket noi trusted AP an...");
-    WiFi.mode(WIFI_STA);
-    WiFi.setHostname("PhantomR3b");
+  // TRUSTED_SSID an -> khong xac nhan bang scan, thu ket noi truc tiep (Hotspot tu Dongle).
+  Serial.println("[WIFI] Thu ket noi trusted AP an (Hotspot)...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("PhantomR3b");
 
-    Serial.println("[WIFI] Ket noi STA...");
-    WiFi.setSleep(false);
-    WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
-    unsigned long t = millis();
-    bool connected = false;
-    while (millis() - t < STA_CONNECT_TIMEOUT_MS)
+  Serial.println("[WIFI] Ket noi STA...");
+  WiFi.setSleep(false);
+  WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
+  unsigned long t = millis();
+  bool connected = false;
+  while (millis() - t < 4000UL)
+  {
+    if (WiFi.status() == WL_CONNECTED)
     {
-      if (WiFi.status() == WL_CONNECTED)
-      {
-        connected = true;
-        break;
-      }
-      delay(200);
+      connected = true;
+      break;
     }
-    if (connected)
-    {
-      currentMode = MODE_STA;
-      updateConnectionLed();
-      Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
-      notifyTrustedHost();
-    }
-    else
-    {
-      Serial.println("[WIFI] Ket noi STA that bai, chuyen sang AP.");
-    }
+    delay(150);
+  }
+  if (connected)
+  {
+    currentMode = MODE_STA;
+    updateConnectionLed();
+    Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    notifyTrustedHost();
+  }
+  else
+  {
+    Serial.println("[WIFI] Khong thay trusted AP, chuyen sang phat AP.");
   }
 
   if (currentMode != MODE_STA)
